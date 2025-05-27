@@ -1,0 +1,702 @@
+#include "tl.h"
+#include <assert.h>
+#include <ctype.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+bool isoperator(int c)
+{
+  return (
+     c == '!'
+  || (c >= '#' && c <= '&')
+  || c == '*'
+  || c == '+'
+  || c == '-'
+  || c == '.'
+  || c == '/'
+  || c == ':'
+  || (c >= '<' && c <= '@')
+  || c == '^'
+  || c == '~'
+  );
+}
+bool isnum(int c)
+{
+  return c >= '0' && c <= '9';
+}
+uint64_t small_name_hash(const char* s, int len)
+{
+  if (len > 8) return 0;
+  uint64_t r = 0;
+  for (int i = 0; i < len; i++)
+    r = (r << 8) | s[i];
+  return r;
+}
+int find_string_global(TLState* TL, const char* s)
+{
+  for (int i = 0; i < TL->consts_len; i++)
+  {
+    if (tl_type_of(TL->consts[i]) == TL_STR)
+    {
+      if (_tl_str_eq(tl_to_str(TL->consts[i]), s))
+      {
+        return i;
+      }
+    }
+  }
+  return -1;
+}
+
+
+
+int int_const_from(TLState* TL, const char* s)
+{
+  _TLInt* i = TL_MALLOC(sizeof(_TLInt));
+  i->type = TL_INT;
+  i->value = atoll(s);
+  return _tl_consts_push(TL, i);
+}
+
+int float_const_from(TLState* TL, const char* s)
+{
+  _TLFloat* i = TL_MALLOC(sizeof(_TLFloat));
+  i->type = TL_INT;
+  i->value = atof(s);
+  return _tl_consts_push(TL, i);
+}
+
+int tl_find_const(TLState* TL, tl_object_t* p)
+{
+  for (int i = 0; i < TL->consts_len; i++)
+  {
+    if (TL->consts[i] == p)
+      return i;
+  }
+  return -1;
+}
+
+bool _tl_token_push(
+  TLState* TL, TokenizerState* TS,
+  TokenizerOut* out, char* btok,
+  int* btoki, TokenType* current,
+  int* depth, const char c,
+  TokenType ctt
+) {
+  assert(out->toksi < TOKEN_STACK_MAX);
+  btok[*btoki] = 0;
+  bool stop_tokenizing = false;
+  switch (*current)
+  {
+  case TOK_FN:
+  case TOK_DO:
+  case TOK_ELIF:
+  case TOK_IF:
+  case TOK_WHILE:
+  case TOK_END:
+  case TOK_THEN:
+  case TOK_BREAK:
+  case TOK_CONTINUE:
+  case TOK_RETURN:
+  case TOK_ELSE:
+  case TOK_CALL:
+    assert(false);
+    break;
+  case TOK_NOTHING:
+  case TOK_COMMA:
+    break;
+  case TOK_INT:
+    out->toks[out->toksi++] = (Token){TOK_INT,int_const_from(TL, btok),0};
+    break;
+  case TOK_FLOAT:
+    out->toks[out->toksi++] = (Token){
+      *current,
+      float_const_from(TL, btok),
+      0
+    };
+    break;
+  case TOK_NAME:
+    {
+      const uint64_t name_hash = small_name_hash(btok, *btoki);
+      switch (name_hash)
+      {
+// #define HASH_CASE_C(NAME) 
+//             case (HASH_##NAME) : current = TOK_##NAME ; break;
+// #define HASH_CASE_S(NAME) 
+//             case (HASH_##NAME) : 
+//             current = TOK_##NAME ; stop_tokenizing = true; break;
+        case HASH_FN: *current = TOK_FN; break;
+        case HASH_RETURN: *current = TOK_RETURN; break;
+        case HASH_IF: *current = TOK_IF; stop_tokenizing = true; break; 
+        case HASH_ELIF: *current = TOK_ELIF; stop_tokenizing = true; break; 
+        case HASH_ELSE: *current = TOK_ELSE; stop_tokenizing = true; break; 
+        case HASH_WHILE: *current = TOK_WHILE; stop_tokenizing = true; break; 
+        case HASH_DO: *current = TOK_DO; stop_tokenizing = true; break; 
+        case HASH_THEN: *current = TOK_THEN; stop_tokenizing = true; break; 
+        case HASH_BREAK: *current = TOK_BREAK; stop_tokenizing = true; break; 
+        case HASH_CONTINUE: *current = TOK_CONTINUE; stop_tokenizing = true; break; 
+        case HASH_END: *current = TOK_END; stop_tokenizing = true; break; 
+// #undef HASH_CASE
+      }
+      if (*current >= TOK_FN)
+      {
+        out->toks[out->toksi++] = (Token){*current,0,0};
+      }
+      else
+      {
+        int i = find_string_global(TL, btok);
+        if (i == -1)
+        {
+          i = _tl_consts_push_str(TL, btok);
+        }
+        out->toks[out->toksi++] = (Token){TOK_NAME, i, 0};
+      }
+      break;
+    }
+  case TOK_OP:
+    {
+      int i = find_string_global(TL, btok);
+      if (i == -1)
+      {
+        i = _tl_consts_push_str(TL, btok);
+      }
+      out->toks[out->toksi++] = (Token){TOK_OP, i, 0};
+      const TLName* name = tl_get_name_ex(TL->scope, i);
+      if (name)
+      {
+        const TLType type = tl_type_of(name->data);
+        if (type == TL_FUNC || type == TL_CFUNC)
+        {
+          const uint8_t prec = tl_precedence(name->data);
+          if (prec > out->max_prec)
+            out->max_prec = prec;
+        }
+      }
+      break;
+    }
+  case TOK_PARENTH:
+    {
+      if (btok[0] == ')')
+      {
+        int j;
+        for (j = 0; j < out->toksi; j++)
+        {
+          if (
+             out->toks[out->toksi-j-1].type == TOK_PARENTH
+          && out->toks[out->toksi-j-1].arg == UNSET_PARENTH
+          ) {
+            out->toks[out->toksi-j-1].arg = j;
+            break;
+          }
+        }
+        depth--;
+        assert(j < out->toksi);
+      }
+      else
+      {
+        depth++;
+        out->toks[out->toksi++] = (Token){*current, UNSET_PARENTH, 0};
+      }
+      break;
+    }
+  case TOK_STR:
+    {
+      int offset = 1;
+      const int len = *btoki-1;
+      for (int i = 0; i < len-offset; i++)
+      {
+        btok[i] = btok[i+offset];
+        if (btok[i] == '\\')
+        {
+          switch (btok[i+offset+1])
+          {
+            case 'n': btok[i] = '\n'; offset++; break;
+            case 'r': btok[i] = '\r'; offset++; break;
+            case 'e': btok[i] = '\e'; offset++; break;
+            case 'b': btok[i] = '\b'; offset++; break;
+            case 'a': btok[i] = '\a'; offset++; break;
+            case '"': btok[i] = '"'; offset++; break;
+            case '\'': btok[i] = '\''; offset++; break;
+            case '\\': btok[i] = '\\'; offset++; break;
+            case 'x':
+              {
+                assert(len > i+offset+3);
+                const char digits[3] = {
+                  btok[i+offset+2], btok[i+offset+3], 0
+                };
+                btok[i] = strtol(digits, NULL, 16);
+                offset += 3;
+                break;
+              }
+          }
+        }
+      }
+      btok[len-offset] = 0;
+      out->toks[out->toksi++] = (Token){
+        *current,
+        _tl_consts_push_str(TL, btok),
+        0
+      };
+      break;
+    }
+  }
+  // if (*current != TOK_NOTHING)
+  *btoki = 0;
+  *current = ctt;
+  return stop_tokenizing;
+}
+bool is_single_token(TokenType t)
+{
+  return (
+     t == TOK_PARENTH
+  || t == TOK_COMMA
+  );
+}
+TokenizerOut tl_tokenize_string(TLState *G, TokenizerState* TS, char *code)
+{
+  TokenizerOut out;
+  char btok[TOKEN_STR_MAX];
+  int btoki = 0;
+  int depth = 0;
+  TokenType current = TOK_NOTHING;
+  TokenType ctt;
+  char c;
+  out.max_depth = out.max_prec = out.toksi = 0;
+  if (TS->len == 0)
+    return TOKENIZER_EOF;
+  for (; TS->i < TS->len; TS->i++)
+  {
+    c = code[TS->i];
+    if (c == '\n' || c == ';')
+    {
+      if (depth == 0)
+        goto FINISH;
+      else continue;
+    }
+    if (btoki > 0 && (btok[0] == '"' || btok[0] == '\''))
+    {
+      if (
+        (c == '"' || c == '\'') &&
+        (
+          btok[btoki-1] != '\\' ||
+          (btoki > 1 && btok[btoki-2] == '\\')
+        )
+      )
+      { btok[btoki++] = c; c = 0; ctt = TOK_NOTHING; }
+      else
+        ctt = TOK_STR;
+    }
+    else if (c == '"' || c == '\'')
+      ctt = TOK_STR;
+    else if (c == ',')
+      ctt = TOK_COMMA;
+    else if (c == ':')
+    {
+      if (current == TOK_NAME)
+        ctt = TOK_NAME;
+      else if (current == TOK_INT)
+      { current = TOK_FLOAT; ctt = TOK_FLOAT; }
+      else
+        current = TOK_FLOAT;
+    }
+    else if (isalpha(c) || c == '_')
+    {
+      if (btoki == 1 && btok[0] == ':')
+        current = TOK_NAME;
+      ctt = TOK_NAME;
+    }
+    else if (isoperator(c))
+      ctt = TOK_OP;
+    else if (isnum(c))
+    {
+      if (current == TOK_NAME)
+        ctt = TOK_NAME;
+      else if (current == TOK_FLOAT)
+        ctt = TOK_FLOAT;
+      else
+        ctt = TOK_INT;
+    }
+    else if (c == '(' || c == ')')
+    {
+      ctt = TOK_PARENTH;
+      if (out.toksi > 2 && out.toks[0].type == TOK_FN && c == ')')
+        goto FINISH;
+    }
+    else if (c == ' ')
+      ctt = TOK_NOTHING;
+    // TODO: LISTS
+    
+    if (ctt != current || is_single_token(ctt))
+    {
+      if (_tl_token_push(
+        G, TS, &out, btok, &btoki,
+        &current, &depth, c, ctt
+      ))
+      {
+        goto FINISH;
+      }
+    }
+    if (ctt != TOK_NOTHING)
+      btok[btoki++] = c;
+  }
+FINISH:
+  _tl_token_push(
+    G, TS, &out, btok, &btoki,
+    &current, &depth, 0, current
+  );
+  // printf("Test %i\n", (int)c);
+  // if (c == ')' && c != 0)
+  // {
+  //   btok[0] = ')';
+  //   btoki = 1;
+  //   current = TOK_PARENTH;
+  //   _tl_token_push(
+  //     TL, TS, &out, btok, &btoki,
+  //     &current, &depth, 0, current
+  //   );
+  // }
+  TS->i++;
+  return out;
+}
+
+// void _bc_pre_add(TLState* TL, int count)
+// {
+//   if (TL->bclen+count <= TL->bccap)
+//     return;
+//   while (TL->bccap < TL->bclen+count)
+//     TL->bccap += TL->bccap/2 + (TL->bccap < 2);
+//   if (TL->bytecode)
+//     TL->bytecode = realloc(TL->bytecode, TL->bccap*sizeof(uint32_t));
+//   else
+//     TL->bytecode = calloc(TL->bccap, sizeof(uint32_t));
+// }
+void _bc_push(TLState* G, uint32_t code)
+{
+  G->bc_len++;
+  if (G->bc_len > G->bc_cap)
+  {
+    G->bc_cap += G->bc_cap/2 + (G->bc_cap < 2);
+    if (G->bc)
+      G->bc = realloc(G->bc, G->bc_cap*sizeof(uint32_t));
+    else
+      G->bc = calloc(G->bc_cap, sizeof(uint32_t));
+  }
+  G->bc[G->bc_len-1] = code;
+}
+
+int tl_expr_to_rpn(
+  TLState* G,
+  TokenizerOut* toks,
+  int start, int len)
+{
+  Token* T = toks->toks+start;
+  int redux = 0; // shortening of toks
+  // Function calls
+  for (int i = 0; i < len-1; i++)
+  {
+    if (
+      T[i].type == TOK_NAME
+      && T[i+1].type == TOK_PARENTH
+    ) {
+      const int name_index = i;
+      int arg_start = i+2;
+      int args_len = T[i+1].arg;
+      int argc = 0;
+      assert(i+args_len < len);
+      i++;
+      while (i < name_index+args_len+1)
+      {
+        i++;
+        if (T[i].type == TOK_COMMA)
+        {
+          tl_expr_to_rpn(G, toks, arg_start, i - arg_start);
+          i++;
+          argc++;
+          arg_start = i;
+        }
+      }
+      if (args_len != 0)
+      {
+        tl_expr_to_rpn(G, toks, arg_start, i - arg_start);
+        argc++;
+      }
+      Token temp = T[name_index];
+      memmove(T+name_index, T+name_index+2, sizeof(Token)*args_len);
+      T[name_index+args_len] = temp;
+      T[name_index].tokenized = args_len+2;
+      // NOTE:
+      // last element is parenthesis to indicate function call
+      // argument of the token is number of arguments in call
+      T[name_index+args_len+1] = (Token){TOK_CALL, argc, args_len+2};
+    }
+    // operation call: (f + g)(arg1, arg2, ...)
+    // else if (
+    //   (
+    //     T[i].type == TOK_PARENTH &&
+    //     i+T[i].arg < len &&
+    //     T[i+T[i].arg].type == TOK_PARENTH
+    //   ) || (
+    //     T[i].tokenized != 0 &&
+    //     i+T[i].tokenized < len &&
+    //     T[i+T[i].tokenized].type == TOK_PARENTH
+    //   )
+    // ) {
+    //   tl_expr_to_rpn(TL, toks, i+1, i+)
+    // }
+  }
+  const int PLS_MAX = 256;
+  // parenthesis lengths (stack)
+  int pls[PLS_MAX];
+  int pls_len;
+  // Operators
+  for (int depth = toks->max_depth; depth >= 0; depth--)
+  {
+    pls_len = 0;
+    for (int prec = toks->max_prec; prec >= 0; prec--)
+    {
+      for (int i = 0; i < len; i++)
+      {
+        if (T[i].tokenized != 0)
+        {
+          i += T[i].tokenized - 1;
+          continue;
+        }
+        while (pls_len > 0 && pls[pls_len-1] + T[pls[pls_len-1]].arg < i)
+          pls_len--;
+        if (T[i].type == TOK_PARENTH)
+        {
+          assert(pls_len < PLS_MAX);
+          pls[pls_len++] = i;
+        }
+        else if (depth == pls_len)
+        {
+          const TLName* name = tl_has_name_ex(G->scope, T[i].arg);
+          tl_object_t* op = name ? name->data : NULL;
+          if (T[i].type == TOK_OP && tl_type_of(op) == TL_NIL)
+          {
+            fprintf(
+              stderr,
+              "ERROR: Use of undeclared operator '%s'.\n",
+              tl_to_str(G->consts[T[i].arg])
+            );
+            return 0;
+          }
+          if (
+             T[i].type == TOK_OP
+          && tl_precedence(op) == prec
+          ) {
+            if (i == 0 || (T[i-1].tokenized == 0 && T[i-1].type == TOK_OP))
+            {
+              assert(len > 1);
+              // '-b' in 'a+-b'
+              // '-(a+b)' in '-(a+b)+c'
+              const int right_len = T[i+1].tokenized ? T[i+1].tokenized : 1;
+              Token temp = T[i];
+              memmove(T+i, T+i+1, sizeof(Token)*right_len);
+              temp.op_argc = 1;
+              T[i+right_len] = temp;
+              T[i].tokenized = 1+right_len;
+              T[i+right_len].tokenized = 1+right_len;
+              i += right_len; //+1 (after temp) -1 (for loop increment)
+            }
+            else
+            {
+              assert(len > 2);
+              // 'a+b' in 'a+b+c' (depth = 0)
+              // 'a+b' in '(a+b)*c' (depth = 1)
+              const int left_len = T[i-1].tokenized ? T[i-1].tokenized : 1;
+              const int right_len = T[i+1].tokenized ? T[i+1].tokenized : 1;
+              Token temp = T[i];
+              memmove(T+i, T+i+1, sizeof(Token)*right_len);
+              temp.op_argc = 2;
+              T[i+right_len] = temp;
+              T[i-left_len].tokenized = 1+left_len+right_len;
+              T[i+right_len].tokenized = 1+left_len+right_len;
+              i += right_len; //+1 (after temp) -1 (for loop increment)
+            }
+          }
+        }
+      }
+    }
+    // Remove parenthesis of done depth
+    int offset = 0;
+    pls_len = 0;
+    for (int i = 0; i < len; i++)
+    {
+      while (pls_len > 0 && pls[pls_len-1] + T[pls[pls_len-1]].arg < i)
+        pls_len--;
+      if (T[i].type == TOK_PARENTH)
+      {
+        if (pls_len+1 == depth)
+        {
+          redux++;
+          offset++;
+          len--;
+        }
+        else
+        {
+          assert(pls_len < PLS_MAX);
+          pls[pls_len++] = i;
+        }
+      }
+      T[i] = T[i+offset];
+    }
+  }
+  return redux;
+}
+void tl_rpn_to_bytecode(TLState* G, TokenizerOut* rpn, int start, int len)
+{
+  for (int i = start; i < start+len; i++)
+  {
+    if (rpn->toks[i].type == TOK_NAME || rpn->toks[i].type == TOK_OP)
+    {
+      _bc_push(G, CODE(TLOP_COPY_NAME, rpn->toks[i].arg));
+      if (rpn->toks[i].type == TOK_OP)
+        _bc_push(G, CODE(TLOP_CALL, rpn->toks[i].op_argc));
+    }
+    else if (rpn->toks[i].type == TOK_PARENTH)
+      assert(false);
+    else if (rpn->toks[i].type == TOK_CALL)
+      _bc_push(G, CODE(TLOP_CALL, rpn->toks[i].arg));
+    else
+      _bc_push(G, CODE(TLOP_COPY_CONST, rpn->toks[i].arg));
+  }
+}
+
+void tl_parse_to_bytecode(TLState* TL, char* code)
+{
+#define MAX_FUNC 16
+  TokenizerState TS;
+  // int func_depths_stack[MAX_FUNC];
+  // int func_depths_sp = 0;
+  int cond_depth = 0;
+  TS.i = 0;
+  TS.len = _tl_str_len(code);
+  while (TS.i < TS.len)
+  {
+    const int _prev_i = TS.i;
+    TokenizerOut toks = tl_tokenize_string(TL, &TS, code);
+    if (toks.toksi == 0)
+    {
+      assert(TS.i != _prev_i);
+      continue;
+    }
+    switch (toks.toks[toks.toksi-1].type)
+    {
+    case TOK_BREAK:
+      _bc_push(TL, CODE(TLOP_BREAK, cond_depth));
+      continue;
+    case TOK_CONTINUE:
+      _bc_push(TL, CODE(TLOP_CONTINUE, cond_depth));
+      continue;
+    case TOK_IF:
+      cond_depth++;
+      _bc_push(TL, CODE(TLOP_COND, cond_depth));
+      continue;
+    case TOK_ELIF:
+      _bc_push(TL, CODE(TLOP_COND, cond_depth));
+      continue;
+    case TOK_WHILE:
+      cond_depth++;
+      _bc_push(TL, CODE(TLOP_COND, cond_depth));
+      continue;
+    case TOK_THEN:
+      _bc_push(TL, CODE(TLOP_IF, cond_depth));
+      continue;
+    case TOK_DO:
+      _bc_push(TL, CODE(TLOP_WHILE, cond_depth));
+      continue;
+    case TOK_ELSE:
+      _bc_push(TL, CODE(TLOP_ELSE, cond_depth));
+      continue;
+    case TOK_END:
+      // if (cond_depth == func_depths_stack[func_depths_sp-1])
+      // {
+      //   _bc_push(TL, CODE(TLOP_RET, 0));
+      // }
+      _bc_push(TL, CODE(TLOP_END, cond_depth));
+      cond_depth--;
+      continue;
+    default:
+      toks.toksi++;
+      break;
+    }
+    toks.toksi--;
+    if (toks.toks[0].type == TOK_FN)
+    {
+      assert(toks.toksi >= 3);
+      uint32_t prec = 255;
+      tl_object_t obj;
+      int argc = 0;
+      int offset = 0;
+      if (toks.toks[1].type == TOK_INT)
+      {
+        // 'fn' <prec> <func_name> '(' ...
+        assert(toks.toks[2].type == TOK_NAME);
+        prec = tl_to_int(TL->consts[toks.toks[1].arg]);
+        offset = 1;
+      }
+      // else
+      //  'fn' <func_name> '(' ...
+
+      const int new_func_name_pos = toks.toks[1+offset].arg;
+      _bc_push(TL, CODE(TLOP_FNH, TL->consts_len));
+      _bc_push(TL, CODE(TLOP_FN, new_func_name_pos));
+      for (int i = 3+offset; i < toks.toksi; i++)
+      {
+        assert(toks.toks[i].type == TOK_NAME);
+        _bc_push(TL, CODE(TLOP_NEW_NAME, toks.toks[i].arg));
+        _bc_push(TL, CODE(TLOP_PARAM, i - 3 - offset));
+        argc++;
+      }
+
+      if (toks.toks[2].type == TOK_OP)
+        assert(argc == 1 || argc == 2);
+        // operators can only have 1 or 2 arguments
+
+      obj = TL->scope->names[toks.toks[1+offset].arg].data;
+      if (tl_type_of(obj) != TL_NIL)
+      {
+        int str_i = find_string_global(TL, "super");
+        if (str_i == -1)
+          str_i = _tl_consts_push_str(TL, "super");
+        const int func_idx = tl_find_const(TL, obj);
+        _bc_push(TL, CODE(TLOP_COPY_CONST, func_idx));
+        _bc_push(TL, CODE(TLOP_ASSIGN_NAME, str_i));
+        _bc_push(TL, CODE(TLOP_POP, 1));
+      }
+      _TLFunc* f = TL_MALLOC(sizeof(_TLFunc));
+      f->argc = argc;
+      f->bytecode_pt = TL->bc_len - argc*2;
+      f->prec = prec;
+      f->type = TL_FUNC;
+      _tl_consts_push(TL, f);
+      cond_depth++;
+    }
+    else if (toks.toks[0].type == TOK_RETURN)
+    {
+      int i = 1;
+      int ret_count = 0;
+      while (i < toks.toksi)
+      {
+        const int start = i;
+        while (i < toks.toksi && toks.toks[i].type != TOK_COMMA)
+          i++;
+        ret_count++;
+        const int redux = tl_expr_to_rpn(TL, &toks, start, i-start);
+        tl_rpn_to_bytecode(TL, &toks, start, i-start-redux);
+        i++;
+      }
+      _bc_push(TL, CODE(TLOP_RET, ret_count));
+    }
+    else
+    {
+      const int redux = tl_expr_to_rpn(TL, &toks, 0, toks.toksi);
+      tl_rpn_to_bytecode(TL, &toks, 0, toks.toksi-redux);
+    }
+  }
+}
+
+void tl_compile_string(TLState *TL, char *ref_code)
+{}
+
