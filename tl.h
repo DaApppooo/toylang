@@ -177,6 +177,7 @@ void tl_register_func(
   TLState* TL, tl_cfunc_ptr_t f,
   const char* name, int max_arg, int prec
 );
+int _tl_op_call(TLScope* S, int argc);
 
 // === names ===
 TLPathInfo _tl_piname(TLScope* TL, const char* name);
@@ -184,6 +185,8 @@ const char* tl_name_to_str(TLScope* TL, int idx);
 TLName* tl_name_walk_path(TLScope* TL, TLPathInfo path);
 // Creates name if it doesn't exist. Should never returns NULL.
 TLName* tl_get_name_ex(TLScope* TL, int global_stack_str_index);
+// Creates name if it doesn't exist. Should never returns NULL.
+TLName* tl_get_name(TLScope* TL, const char* s);
 // Doesn't create the name. Returns NULL if the name doesn't exist.
 TLName* tl_has_name_ex(TLScope* TL, int global_stack_str_index);
 // Returns name index (used in bytecode)
@@ -203,6 +206,12 @@ static inline int tl_push(TLScope* TL, tl_object_t obj)
 // === stack values ===
 //  == getters ==
 
+static inline tl_object_t tl_get(TLScope* S, int index)
+{
+  if (index < 0)
+    index = S->stack_top + index;
+  return S->stack[index].object;
+}
 static inline TLData* tl_top_ex(TLScope* S)
 { return &(S->stack[S->stack_top-1]); }
 static inline tl_object_t tl_top(TLScope* S)
@@ -344,6 +353,12 @@ static inline TLOpCode tlbc_opcode(uint64_t unit)
 static inline uint32_t tlbc_arg(uint64_t unit)
 { return unit & 0x00ffffff; }
 void tl_run_bytecode(TLState* TL);
+int tl_run_bytecode_ex(
+  TLScope* TL,
+  tl_object_t scope,
+  int depth,
+  int param_count
+);
 
 
 // === parsing and compilation ===
@@ -404,7 +419,7 @@ typedef struct Token
   // 0 => token hasn't been moved into a rpn layout
   // otherwise(n) => following n tokens have been moved into a rpn layout
   //                 and must be moved together
-  uint16_t tokenized;
+  uint16_t rpned;
   uint16_t op_argc; // only for operators and functions
 } Token;
 static const uint32_t UNSET_PARENTH = 0xffffff;

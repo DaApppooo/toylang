@@ -1,7 +1,7 @@
 #include "tl.h"
 #include <assert.h>
 
-int tl_run_bytecode_pro(
+int tl_run_bytecode_ex(
   TLScope* TL,
   tl_object_t scope,
   int depth,
@@ -134,24 +134,7 @@ int tl_run_bytecode_pro(
             }
             else if (func_type == TL_FUNC)
             {
-              const _TLFunc* f = (_TLFunc*)tl_top(TL);
-              TLScope* child = tl_new_scope_pro(
-                TL->global, TL, TL->stack_cap, TL->max_name_count, f->bytecode_pt
-              );
-              const int ret_count = tl_run_bytecode_pro(
-                child, (void*)f, depth+1, tlbc_arg(code)
-              );
-              const int offset = child->stack_top - ret_count;
-              for (int i = 0; i < ret_count; i++)
-              {
-                TL->stack[prearg_stack_top+i] = child->stack[i+offset];
-                if (TL->stack[prearg_stack_top+i].carrier.up == 0)
-                  TL->stack[prearg_stack_top+i].carrier = TL_INVALID_PATH;
-                else
-                  TL->stack[prearg_stack_top+i].carrier.up--;
-              }
-              TL->stack_top = prearg_stack_top + ret_count;
-              tl_destroy_scope(child);
+
             }
             else
             {
@@ -331,6 +314,6 @@ int tl_run_bytecode_pro(
 }
 void tl_run_bytecode(TLState* TL)
 {
-  tl_run_bytecode_pro(TL->scope, NULL, 0, 0);
+  tl_run_bytecode_ex(TL->scope, NULL, 0, 0);
 }
 

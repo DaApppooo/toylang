@@ -34,6 +34,7 @@ int main(int argc, const char* argv[])
     TLState* TL = tl_new_state();
     tl_load_openlib(TL);
     tl_parse_to_bytecode(TL, buf);
+    tl_fdebug_state(stdout, TL);
     tl_run_bytecode(TL);
     tl_destroy(TL);
     free(buf);

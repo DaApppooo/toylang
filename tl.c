@@ -79,6 +79,24 @@ TLName* tl_get_name_ex(TLScope *TL, int global_stack_str_index)
   return org->names + i;
 }
 
+TLName* tl_get_name(TLScope *TL, const char* name)
+{
+  TLScope* org = TL;
+  do
+  {
+    for (int i = 0; i < TL->name_count; i++)
+    {
+      if (_tl_str_eq(tl_name_to_str(TL, i), name))
+        return TL->names + i;
+    }
+    if (TL->parent == NULL)
+      break;
+    TL = TL->parent;
+  } while(true);
+  const int i = tl_set_name(org, name, NULL);
+  return org->names + i;
+}
+
 TLName* tl_has_name_ex(TLScope *TL, int global_stack_str_index)
 {
   do
@@ -145,7 +163,15 @@ TLScope* tl_new_scope_pro(
 
 void tl_destroy_scope(TLScope* S)
 {
+  for (int i = 0; i < S->stack_top; i++)
+  {
+    _tl_drop(S->global, S->stack[i].object);
+  }
   TL_FREE(S->stack);
+  for (int i = 0; i < S->name_count; i++)
+  {
+    _tl_drop(S->global, S->names[i].data);
+  }
   TL_FREE(S->names);
   S->stack_cap = S->stack_top = S->name_count = S->max_name_count = 0;
 }
@@ -276,6 +302,8 @@ uint64_t tl_size_of(tl_object_t object)
 
 void _tl_hold(TLState* TL, tl_object_t obj)
 {
+  if (obj == NULL)
+    return;
   int null_found = -1;
   for (int i = 0; i < TL->gc_len; i++)
   {
