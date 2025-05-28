@@ -48,6 +48,54 @@ const char* tl_name_to_str(TLScope* S, int idx)
   return tl_to_str(S->global->consts[S->names[idx].global_str_idx]);
 }
 
+// Call function on top of the stack
+// returns C's exit status (EXIT_FAILURE or EXIT_SUCCESS)
+int tl_call(TLScope* S, int argc)
+{
+  const int old_stack_top = S->stack_top;
+  const TLType func_type = tl_type_of(tl_top(S));
+  const int prearg_stack_top = old_stack_top - argc - 1;
+  if (func_type == TL_NIL)
+  {
+    fprintf(stderr, "ERROR: Calling a nil value.\n");
+    return EXIT_FAILURE;
+  }
+  else if (func_type == TL_FUNC)
+  {
+    const _TLFunc* f = (_TLFunc*)tl_top(S);
+    TLScope* child = tl_new_scope_ex(
+      S->global, S, S->stack_cap, S->max_name_count, f->bytecode_pt
+    );
+    const int ret_count = tl_run_bytecode_ex(
+      child, (void*)f, 1, argc-1
+    );
+    const int offset = child->stack_top - ret_count;
+    for (int i = 0; i < ret_count; i++)
+    {
+      S->stack[prearg_stack_top+i] = child->stack[i+offset];
+      _tl_hold(S->global, S->stack[prearg_stack_top+i].object);
+      if (S->stack[prearg_stack_top+i].carrier.up == 0)
+        S->stack[prearg_stack_top+i].carrier = TL_INVALID_PATH;
+      else
+        S->stack[prearg_stack_top+i].carrier.up--;
+    }
+    S->stack_top = prearg_stack_top + ret_count;
+    tl_destroy_scope(child);
+  }
+  else if (func_type == TL_CFUNC)
+  {
+    const _TLCFunc* f = (_TLCFunc*)tl_top(S);
+    const int ret_count = f->ptr(S, argc);
+    const int offset = S->stack_top - ret_count;
+    for (int i = 0; i < ret_count; i++)
+    {
+      S->stack[i+prearg_stack_top] = S->stack[i+offset];
+    }
+    S->stack_top = prearg_stack_top + ret_count;
+  }
+  return EXIT_SUCCESS;
+}
+
 void tl_register_func(
   TLState* TL, tl_cfunc_ptr_t f,
   const char* name, int max_arg, int prec
@@ -122,14 +170,14 @@ TLState* tl_new_state()
   TL->gc_ref_counts = NULL;
   TL->consts_cap = TL->consts_len = TL->bc_cap = TL->bc_len
     = TL->gc_cap = TL->gc_len = 0;
-  TL->scope = tl_new_scope_pro(
+  TL->scope = tl_new_scope_ex(
     TL, NULL, DEFAULT_STACK_CAP,
     DEFAULT_MAX_NAME_COUNT, -1
   );
   return TL;
 }
 
-TLScope* tl_new_scope_pro(
+TLScope* tl_new_scope_ex(
   TLState* state,
   TLScope* parent,
   int mem_size, int max_name_count,

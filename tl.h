@@ -151,7 +151,7 @@ static inline bool tl_is_valid_path(TLPathInfo pi)
 {
   return pi.up < UINT8_MAX;
 }
-TLScope* tl_new_scope_pro(
+TLScope* tl_new_scope_ex(
   TLState* state,
   TLScope* parent,
   int stack_cap,
@@ -206,6 +206,9 @@ static inline int tl_push(TLScope* TL, tl_object_t obj)
 // === stack values ===
 //  == getters ==
 
+// Call function on top of the stack
+// returns C's exit status (EXIT_FAILURE or EXIT_SUCCESS)
+int tl_call(TLScope* S, int argc);
 static inline tl_object_t tl_get(TLScope* S, int index)
 {
   if (index < 0)

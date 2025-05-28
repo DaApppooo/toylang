@@ -2,25 +2,11 @@
 
 int _tl_op_call(TLScope *S, int argc)
 {
-  const _TLFunc* f = (_TLFunc*)tl_top(S);
-  TLScope* child = tl_new_scope_ex(
-    S->global, S, S->stack_cap, S->max_name_count, f->bytecode_pt
-  );
-  const int ret_count = tl_run_bytecode_pro(
-    child, (void*)f, depth+1, tlbc_arg(code)
-  );
-  const int offset = child->stack_top - ret_count;
-  for (int i = 0; i < ret_count; i++)
-  {
-    S->stack[prearg_stack_top+i] = child->stack[i+offset];
-    _tl_hold(S->global, S->stack[prearg_stack_top+i].object);
-    if (S->stack[prearg_stack_top+i].carrier.up == 0)
-      S->stack[prearg_stack_top+i].carrier = TL_INVALID_PATH;
-    else
-      S->stack[prearg_stack_top+i].carrier.up--;
-  }
-  S->stack_top = prearg_stack_top + ret_count;
-  tl_destroy_scope(child);
+  tl_pop(S);
+  tl_call(S, argc-1);
+  // official returns 0 values because the return values are
+  // already set up in the initial stack, no need to move anything.
+  return 0;
 }
 
 int op_eq(TLScope* TL, int argc)
@@ -132,6 +118,7 @@ int _debug_state(TLScope* TL, int argc)
 
 void tl_load_openlib(TLState* TL)
 {
+  tl_register_func(TL, &_tl_op_call, "()", 999999, 15);
   tl_register_func(TL, &op_eq, "=", 2, 1);
   tl_register_func(TL, &op_add, "+", 2, 4);
   tl_register_func(TL, &print, "print", 2, 255);
