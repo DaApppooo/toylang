@@ -213,6 +213,8 @@ static inline tl_object_t tl_get(TLScope* S, int index)
 {
   if (index < 0)
     index = S->stack_top + index;
+  if (index < 0 || index >= S->stack_top)
+    return NULL;
   return S->stack[index].object;
 }
 static inline TLData* tl_top_ex(TLScope* S)
@@ -298,6 +300,7 @@ tl_object_t tl_end_list(TLScope* TL);
 void tl_fdebug_state(FILE* f, TLState* TL);
 void tl_fdebug_instr(FILE* f, TLScope* TL, uint32_t code);
 void tl_fdebug_obj(FILE* f, tl_object_t obj);
+void tl_fdebug_scope(FILE* f, TLScope* S);
 
 
 // === bytecode ===
@@ -348,7 +351,10 @@ typedef enum : uint8_t
   TLOP_BREAK, // break
   TLOP_CONTINUE, // continue
   TLOP_RET, // ret <count>
-  TLOP_END // end <depth>
+  TLOP_END, // end <depth>
+  TLOP_EOS, // eos // End Of Statement,
+                   // avoid overflowing the stack with unused returned value
+                   // put between statements
 } TLOpCode;
 #define CODE(OPCODE, OPERAND) ((OPCODE<<24)|(OPERAND))
 static inline TLOpCode tlbc_opcode(uint64_t unit)
@@ -440,6 +446,7 @@ typedef struct TokenizerOut
 static const TokenizerOut TOKENIZER_EOF = (TokenizerOut){{}, -1, -1, -1};
 TokenizerOut tl_tokenize_string(TLState *TL, TokenizerState* TS, char *code);
 void tl_parse_to_bytecode(TLState* TL, char* code);
+void tl_debug_token_array(TLState* TL, Token* a, int len, int current);
 
 #endif
 

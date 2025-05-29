@@ -49,16 +49,19 @@ const char* tl_name_to_str(TLScope* S, int idx)
 }
 
 // Call function on top of the stack
-// returns C's exit status (EXIT_FAILURE or EXIT_SUCCESS)
+// Returns the amount of returned values
 int tl_call(TLScope* S, int argc)
 {
+  printf("===========================\n");
+  tl_fdebug_scope(stdout, S);
   const int old_stack_top = S->stack_top;
   const TLType func_type = tl_type_of(tl_top(S));
   const int prearg_stack_top = old_stack_top - argc - 1;
+  int retc = 0;
   if (func_type == TL_NIL)
   {
     fprintf(stderr, "ERROR: Calling a nil value.\n");
-    return EXIT_FAILURE;
+    return 0;
   }
   else if (func_type == TL_FUNC)
   {
@@ -66,34 +69,53 @@ int tl_call(TLScope* S, int argc)
     TLScope* child = tl_new_scope_ex(
       S->global, S, S->stack_cap, S->max_name_count, f->bytecode_pt
     );
-    const int ret_count = tl_run_bytecode_ex(
-      child, (void*)f, 1, argc-1
+    retc = tl_run_bytecode_ex(
+      child, (void*)f, 1, argc
     );
-    const int offset = child->stack_top - ret_count;
-    for (int i = 0; i < ret_count; i++)
+    const int offset = child->stack_top - retc;
+    for (int i = 0; i < retc; i++)
     {
       S->stack[prearg_stack_top+i] = child->stack[i+offset];
       _tl_hold(S->global, S->stack[prearg_stack_top+i].object);
-      if (S->stack[prearg_stack_top+i].carrier.up == 0)
-        S->stack[prearg_stack_top+i].carrier = TL_INVALID_PATH;
-      else
-        S->stack[prearg_stack_top+i].carrier.up--;
+      if (tl_is_valid_path(S->stack[prearg_stack_top+i].carrier))
+      {
+        if (S->stack[prearg_stack_top+i].carrier.up == 0)
+          S->stack[prearg_stack_top+i].carrier = TL_INVALID_PATH;
+        else
+          S->stack[prearg_stack_top+i].carrier.up--;
+      }
+      // if (tl_is_valid_path(S->stack[prearg_stack_top+1].carrier))
+      // {
+      //   tl_object_t s =
+      //     S->global->consts[tl_name_walk_path(S, S->stack[prearg_stack_top+1].carrier)->global_str_idx];
+      //   printf("")
+      // }
     }
-    S->stack_top = prearg_stack_top + ret_count;
+    S->stack_top = prearg_stack_top + retc;
     tl_destroy_scope(child);
   }
   else if (func_type == TL_CFUNC)
   {
     const _TLCFunc* f = (_TLCFunc*)tl_top(S);
-    const int ret_count = f->ptr(S, argc);
-    const int offset = S->stack_top - ret_count;
-    for (int i = 0; i < ret_count; i++)
+    retc = f->ptr(S, argc);
+    const int offset = S->stack_top - retc;
+    for (int i = 0; i < retc; i++)
     {
       S->stack[i+prearg_stack_top] = S->stack[i+offset];
     }
-    S->stack_top = prearg_stack_top + ret_count;
+    S->stack_top = prearg_stack_top + retc;
   }
-  return EXIT_SUCCESS;
+  else
+  {
+    fprintf(stderr,
+      "ERROR: %s is not callable by default.",
+      tl_type_to_str(func_type)
+    );
+    return 0;
+  }
+  if (S->stack_top < 0)
+    S->stack_top = 0;
+  return retc;
 }
 
 void tl_register_func(
@@ -312,7 +334,8 @@ TLName* tl_name_walk_path(TLScope* S, TLPathInfo path)
 
 void tl_pop(TLScope* S)
 {
-  assert(S->stack_top > 0);
+  if (S->stack_top == 0)
+    return;
   S->stack_top--;
   _tl_drop(S->global, S->stack[S->stack_top].object);
 }
@@ -627,6 +650,7 @@ void tl_fdebug_scope(FILE* f, TLScope* S)
   for (int i = 0; i < S->name_count; i++)
   {
     fprintf(f, "  %s = ", tl_name_to_str(S,i));
+    printf("(%p)[%s] ", S->names[i].data, tl_type_to_str(tl_type_of(S->names[i].data)));
     tl_fdebug_obj(f, S->names[i].data);
     fprintf(f, "\n");
   }
@@ -729,7 +753,10 @@ void tl_fdebug_instr(FILE* f, TLScope* TL, uint32_t code)
               tlbc_arg(code));
       break;
     case TLOP_POP:
-      fprintf(f, "pop %i", tlbc_arg(code));
+      fprintf(f, "pop %i\n", tlbc_arg(code));
+      break;
+    case TLOP_EOS:
+      fprintf(f, "eos\n");
       break;
     case TLOP_WHILE:
       fprintf(f, "while (depth=%i)\n", tlbc_arg(code));
@@ -739,7 +766,7 @@ void tl_fdebug_instr(FILE* f, TLScope* TL, uint32_t code)
       break;
     case TLOP_FNH:
       fprintf(f, "fnh %i (object=", tlbc_arg(code));
-      tl_fdebug_obj(f, TL->stack[tlbc_arg(code)].object);
+      tl_fdebug_obj(f, TL->global->consts[tlbc_arg(code)]);
       fprintf(f, ")\n");
       break;
     case TLOP_FN:

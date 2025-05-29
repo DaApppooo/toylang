@@ -86,6 +86,7 @@ bool _tl_token_push(
   assert(out->toksi < TOKEN_STACK_MAX);
   btok[*btoki] = 0;
   bool stop_tokenizing = false;
+  printf("PUSH [%s] (type=%i)\n", btok, *current);
   switch (*current)
   {
   case TOK_FN:
@@ -146,11 +147,8 @@ bool _tl_token_push(
       }
       else
       {
-        int i = find_string_global(TL, btok);
-        if (i == -1)
-        {
-          i = _tl_consts_push_str(TL, btok);
-        }
+        
+        const int i = tl_get_name(TL->scope, btok)->global_str_idx;
         out->toks[out->toksi++] = (Token){TOK_NAME, i, 0};
       }
       break;
@@ -191,13 +189,15 @@ bool _tl_token_push(
             break;
           }
         }
-        depth--;
+        (*depth)--;
         assert(j < out->toksi);
       }
       else
       {
-        depth++;
+        (*depth)++;
         out->toks[out->toksi++] = (Token){*current, UNSET_PARENTH, 0};
+        if (out->max_depth < *depth)
+          out->max_depth = *depth;
       }
       break;
     }
@@ -271,7 +271,7 @@ TokenizerOut tl_tokenize_string(TLState *G, TokenizerState* TS, char *code)
     c = code[TS->i];
     if (c == '\n' || c == ';')
     {
-      if (depth == 0)
+      if (depth == 0 || (depth == 1 && btok[0] == ')'))
         goto FINISH;
       else continue;
     }
@@ -324,7 +324,7 @@ TokenizerOut tl_tokenize_string(TLState *G, TokenizerState* TS, char *code)
       if (out.toksi > 2 && out.toks[0].type == TOK_FN && c == ')')
         goto FINISH;
     }
-    else if (c == ' ')
+    else if (c == ' ' || c == '\t')
       ctt = TOK_NOTHING;
     // TODO: LISTS
     
@@ -347,16 +347,16 @@ FINISH:
     &current, &depth, 0, current
   );
   // printf("Test %i\n", (int)c);
-  // if (c == ')' && c != 0)
-  // {
-  //   btok[0] = ')';
-  //   btoki = 1;
-  //   current = TOK_PARENTH;
-  //   _tl_token_push(
-  //     TL, TS, &out, btok, &btoki,
-  //     &current, &depth, 0, current
-  //   );
-  // }
+  if (c == ')' && c != 0)
+  {
+    btok[0] = ')';
+    btoki = 1;
+    current = TOK_PARENTH;
+    _tl_token_push(
+      G, TS, &out, btok, &btoki,
+      &current, &depth, 0, current
+    );
+  }
   TS->i++;
   return out;
 }
@@ -391,8 +391,9 @@ int tl_expr_to_rpn(
   TokenizerOut* toks,
   int start, int len)
 {
+  printf("[%i to %i]\n", start, start+len);
   Token* T = toks->toks+start;
-  int redux = 0; // shortening of toks
+  const int initial_len = len;
   const int PLS_MAX = 256;
   // parenthesis lengths (stack)
   int pls[PLS_MAX];
@@ -409,27 +410,31 @@ int tl_expr_to_rpn(
           i += T[i].rpned - 1;
           continue;
         }
+        printf("BEFORE: (depth=%i/%i, prec=%i/%i)\n",
+               depth, toks->max_depth,
+               prec, toks->max_prec);
+        tl_debug_token_array(G, T, len, i);
         while (pls_len > 0 && pls[pls_len-1] + T[pls[pls_len-1]].arg < i)
           pls_len--;
         if (T[i].type == TOK_PARENTH)
         {
-          if (depth == pls_len)
+          if (depth-1 == pls_len)
           {
-            if (i > 0 && (T[i-1].type != TOK_OP || T[i-1].rpned > 0))
-            {
+            if (i > 0
+                && (
+                  (
+                     T[i-1].type != TOK_OP
+                  && T[i-1].type != TOK_PARENTH
+                  )
+                || T[i-1].rpned > 0
+                )
+            ) {
               // Call
               // f ( a , b ) -> a b f ()
               // {(f + g)(a, b) ->} f g + ( a , b ) -> a b f g + ()
               if (T[i-1].rpned == 0)
                 T[i-1].rpned = 1;
               
-              printf("start: ");
-              for (int j = 0; j < len; j++)
-              {
-                printf("(type=%i, arg=%i, rpned=%i, op_argc=%i), ",
-                       T[j].type, T[j].arg, T[j].rpned, T[j].op_argc);
-              }
-              puts("");
               // currently: f g + ( a b + , c
               if (T[i].arg == 0)
               {
@@ -439,23 +444,41 @@ int tl_expr_to_rpn(
                 T[i-T[i-1].rpned].rpned = T[i-1].rpned+1;
                 T[i].rpned = T[i-1].rpned+1;
                 T[i].op_argc = 1; // 1 for the function being called
-                for (int j = 0; j < len; j++)
-                {
-                  printf("(type=%i, arg=%i, rpned=%i, op_argc=%i), ",
-                         T[j].type, T[j].arg, T[j].rpned, T[j].op_argc);
-                }
-                puts("");
+                T[i].type = TOK_CALL;
                 continue;
               }
               int argc = 1;
-              for (int param_tok = 0; param_tok < T[i].arg; param_tok++)
+              int param_start = 0;
+              toks->max_depth -= depth;
               {
-                if (T[i+param_tok+1].type == TOK_COMMA)
-                  argc++;
+                for (int param_tok = 0; param_tok < T[i].arg; param_tok++)
+                {
+                  if (T[i+param_tok+1].type == TOK_COMMA)
+                  {
+                    const int rdux = tl_expr_to_rpn(
+                       G, toks,
+                       i+param_start+1 + start,
+                       param_tok-param_start
+                    );
+                    len -= rdux;
+                    T[i].arg -= rdux;
+                    param_start = param_tok;
+                    argc++;
+                  }
+                }
+                const int rdux = tl_expr_to_rpn(
+                   G, toks,
+                   i+param_start+1 + start,
+                   T[i].arg-param_start
+                );
+                len -= rdux;
+                T[i].arg -= rdux;
               }
+              toks->max_depth += depth;
               // currently: f g + ( a b + , c
               // move over the parenthesis
               Token parenth = T[i];
+              parenth.type = TOK_CALL;
               memmove(T+i, T+i+1, parenth.arg*sizeof(Token));
               T[i+parenth.arg] = parenth;
               // currently: f g + a b + , c (
@@ -463,13 +486,6 @@ int tl_expr_to_rpn(
               //                  ^            << i
               //            [---]              << T[i-1].rpned
               // goal:      a b + , c f g + (
-              printf("moved parenth: ");
-              for (int j = 0; j < len; j++)
-              {
-                printf("(type=%i, arg=%i, rpned=%i, op_argc=%i), ",
-                       T[j].type, T[j].arg, T[j].rpned, T[j].op_argc);
-              }
-              puts("");
               const int to_move = T[i-1].rpned;
               for (int imove = 0; imove < to_move; imove++)
               {
@@ -485,15 +501,19 @@ int tl_expr_to_rpn(
               T[i+parenth.arg].rpned = to_move + parenth.arg + 1;
               T[i+parenth.arg].op_argc = argc+1;
               T[i-to_move].rpned = to_move + parenth.arg + 1;
-              for (int j = 0; j < len; j++)
-              {
-                printf("(type=%i, arg=%i, rpned=%i, op_argc=%i), ",
-                       T[j].type, T[j].arg, T[j].rpned, T[j].op_argc);
-              }
-              puts("");
             }
             else
-              assert(false);
+            {
+              toks->max_depth -= depth;
+              const int rdux = tl_expr_to_rpn(G, toks, i+1+start, T[i].arg);
+              len -= rdux;
+              if (T[i+1].rpned)
+              {
+                T[i].rpned = T[i+1].rpned+1;
+                T[i+T[i].rpned-1].rpned = T[i].rpned;
+              }
+              toks->max_depth += depth;
+            }
           }
           else
           {
@@ -549,33 +569,92 @@ int tl_expr_to_rpn(
             }
           }
         }
+        printf("AFTER: (depth=%i/%i, prec=%i/%i)\n",
+               depth, toks->max_depth,
+               prec, toks->max_prec);
+        tl_debug_token_array(G, T, len, i);
       }
     }
     // Remove parenthesis of done depth
-    int offset = 0;
-    pls_len = 0;
-    for (int i = 0; i < len; i++)
-    {
-      while (pls_len > 0 && pls[pls_len-1] + T[pls[pls_len-1]].arg < i)
-        pls_len--;
-      if (T[i].type == TOK_PARENTH)
-      {
-        if (pls_len+1 == depth)
-        {
-          redux++;
-          offset++;
-          len--;
-        }
-        else
-        {
-          assert(pls_len < PLS_MAX);
-          pls[pls_len++] = i;
-        }
-      }
-      T[i] = T[i+offset];
-    }
+    // int offset = 0;
+    // pls_len = 0;
+    // for (int i = 0; i < len; i++)
+    // {
+    //   while (pls_len > 0 && pls[pls_len-1] + T[pls[pls_len-1]].arg < i)
+    //     pls_len--;
+    //   if (T[i].type == TOK_PARENTH)
+    //   {
+    //     if (pls_len == depth)
+    //     {
+    //       offset++;
+    //       len--;
+    //       for (int j = 0; j < pls_len; j++)
+    //       {
+    //         T[pls[j]].arg--;
+    //       }
+    //     }
+    //     else
+    //     {
+    //       assert(pls_len < PLS_MAX);
+    //       pls[pls_len++] = i;
+    //     }
+    //   }
+    //   T[i] = T[i+offset];
+    // }
   }
-  return redux;
+  return initial_len - len;
+}
+void tl_debug_token_array(
+  TLState* TL,
+  Token *a, int len, int current)
+{
+  int par[64];
+  int pls = 0;
+  for (int i = 0; i < len; i++)
+  {
+    while (pls > 0 && par[pls-1] + a[par[pls-1]].arg < i)
+    {
+      printf(" ) ");
+      pls--;
+    }
+    if (i == current)
+    { printf(" {"); }
+    if (a[i].rpned)
+    { printf(" <%i>*", a[i].rpned); }
+    else
+    { printf(" "); }
+    switch (a[i].type)
+    {
+      case TOK_NAME:
+      case TOK_OP:
+        printf("%s ", tl_to_str(TL->consts[a[i].arg]));
+        break;
+      case TOK_BREAK: printf("break "); break;
+      case TOK_CONTINUE: printf("continue "); break;
+      case TOK_COMMA: printf(", "); break;
+      case TOK_IF: printf("if "); break;
+      case TOK_ELIF: printf("elif "); break;
+      case TOK_FLOAT: printf("%lf ", tl_to_float(TL->consts[a[i].arg])); break;
+      case TOK_INT: printf("%li ", tl_to_int(TL->consts[a[i].arg])); break;
+      case TOK_NOTHING: printf("(/) "); break;
+      case TOK_FN: printf("fn "); break;
+      case TOK_CALL: printf("<call> "); break;
+      case TOK_DO: printf("do "); break;
+      case TOK_ELSE: printf("else "); break;
+      case TOK_END: printf("end "); break;
+      case TOK_THEN: printf("then "); break;
+      case TOK_WHILE: printf("while "); break;
+      case TOK_RETURN: printf("return "); break;
+      case TOK_STR: printf("(str)[%s]", tl_to_str(TL->consts[a[i].arg])); break;
+      case TOK_PARENTH:
+        printf("[%i]( ", a[i].arg);
+        par[pls++] = i;
+        break;
+    }
+    if (i == current)
+    { printf("} "); }
+  }
+  puts("");
 }
 void tl_rpn_to_bytecode(TLState* G, TokenizerOut* rpn, int start, int len)
 {
@@ -587,18 +666,19 @@ void tl_rpn_to_bytecode(TLState* G, TokenizerOut* rpn, int start, int len)
       if (rpn->toks[i].type == TOK_OP)
         _bc_push(G, CODE(TLOP_CALL, rpn->toks[i].op_argc));
     }
-    else if (rpn->toks[i].type == TOK_PARENTH)
+    else if (rpn->toks[i].type == TOK_CALL)
     {
       TLName* n = tl_get_name(G->scope, "()");
       _bc_push(G, CODE(TLOP_COPY_NAME, n->global_str_idx));
       _bc_push(G, CODE(TLOP_CALL, rpn->toks[i].op_argc));
     }
-    else if (rpn->toks[i].type == TOK_CALL)
-      _bc_push(G, CODE(TLOP_CALL, rpn->toks[i].arg));
-    else if (rpn->toks[i].type == TOK_COMMA)
+    else if (rpn->toks[i].type == TOK_COMMA
+          || rpn->toks[i].type == TOK_PARENTH)
       ;
     else
+    {
       _bc_push(G, CODE(TLOP_COPY_CONST, rpn->toks[i].arg));
+    }
   }
 }
 
@@ -615,6 +695,7 @@ void tl_parse_to_bytecode(TLState* TL, char* code)
   {
     const int _prev_i = TS.i;
     TokenizerOut toks = tl_tokenize_string(TL, &TS, code);
+    puts("STOP");
     if (toks.toksi == 0)
     {
       assert(TS.i != _prev_i);
@@ -622,45 +703,20 @@ void tl_parse_to_bytecode(TLState* TL, char* code)
     }
     switch (toks.toks[toks.toksi-1].type)
     {
-    case TOK_BREAK:
-      _bc_push(TL, CODE(TLOP_BREAK, cond_depth));
-      continue;
-    case TOK_CONTINUE:
-      _bc_push(TL, CODE(TLOP_CONTINUE, cond_depth));
-      continue;
-    case TOK_IF:
-      cond_depth++;
-      _bc_push(TL, CODE(TLOP_COND, cond_depth));
-      continue;
-    case TOK_ELIF:
-      _bc_push(TL, CODE(TLOP_COND, cond_depth));
-      continue;
-    case TOK_WHILE:
-      cond_depth++;
-      _bc_push(TL, CODE(TLOP_COND, cond_depth));
-      continue;
-    case TOK_THEN:
-      _bc_push(TL, CODE(TLOP_IF, cond_depth));
-      continue;
-    case TOK_DO:
-      _bc_push(TL, CODE(TLOP_WHILE, cond_depth));
-      continue;
-    case TOK_ELSE:
-      _bc_push(TL, CODE(TLOP_ELSE, cond_depth));
-      continue;
     case TOK_END:
-      // if (cond_depth == func_depths_stack[func_depths_sp-1])
-      // {
-      //   _bc_push(TL, CODE(TLOP_RET, 0));
-      // }
-      _bc_push(TL, CODE(TLOP_END, cond_depth));
-      cond_depth--;
-      continue;
+    case TOK_ELSE:
+    case TOK_IF:
+    case TOK_ELIF:
+    case TOK_THEN:
+    case TOK_DO:
+    case TOK_BREAK:
+    case TOK_WHILE:
+    case TOK_CONTINUE:
+      toks.toksi--;
+      break;
     default:
-      toks.toksi++;
       break;
     }
-    toks.toksi--;
     if (toks.toks[0].type == TOK_FN)
     {
       assert(toks.toksi >= 3);
@@ -671,7 +727,8 @@ void tl_parse_to_bytecode(TLState* TL, char* code)
       if (toks.toks[1].type == TOK_INT)
       {
         // 'fn' <prec> <func_name> '(' ...
-        assert(toks.toks[2].type == TOK_NAME);
+        assert(toks.toks[2].type == TOK_NAME
+            || toks.toks[2].type == TOK_OP);
         prec = tl_to_int(TL->consts[toks.toks[1].arg]);
         offset = 1;
       }
@@ -735,6 +792,47 @@ void tl_parse_to_bytecode(TLState* TL, char* code)
       const int redux = tl_expr_to_rpn(TL, &toks, 0, toks.toksi);
       tl_rpn_to_bytecode(TL, &toks, 0, toks.toksi-redux);
     }
+    switch (toks.toks[toks.toksi].type)
+    {
+    case TOK_BREAK:
+      _bc_push(TL, CODE(TLOP_BREAK, cond_depth));
+      continue;
+    case TOK_CONTINUE:
+      _bc_push(TL, CODE(TLOP_CONTINUE, cond_depth));
+      continue;
+    case TOK_IF:
+      cond_depth++;
+      _bc_push(TL, CODE(TLOP_COND, cond_depth));
+      continue;
+    case TOK_ELIF:
+      _bc_push(TL, CODE(TLOP_COND, cond_depth));
+      continue;
+    case TOK_WHILE:
+      cond_depth++;
+      _bc_push(TL, CODE(TLOP_COND, cond_depth));
+      continue;
+    case TOK_THEN:
+      _bc_push(TL, CODE(TLOP_IF, cond_depth));
+      continue;
+    case TOK_DO:
+      _bc_push(TL, CODE(TLOP_WHILE, cond_depth));
+      continue;
+    case TOK_ELSE:
+      _bc_push(TL, CODE(TLOP_ELSE, cond_depth));
+      continue;
+    case TOK_END:
+      // if (cond_depth == func_depths_stack[func_depths_sp-1])
+      // {
+      //   _bc_push(TL, CODE(TLOP_RET, 0));
+      // }
+      _bc_push(TL, CODE(TLOP_END, cond_depth));
+      cond_depth--;
+      continue;
+    default:
+      break;
+    }
+    toks.toks[toks.toksi].type = TOK_NOTHING;
+    _bc_push(TL, CODE(TLOP_EOS, 0));
   }
 }
 

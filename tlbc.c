@@ -30,9 +30,12 @@ int tl_run_bytecode_ex(TLScope *TL, tl_object_t scope, int depth,
       assert(tlbc_arg(code) >= 0);
       assert(tlbc_arg(code) < TL->global->consts_len);
       assert(fnh_register != -1);
-      const int pos = tl_push(TL, TL->global->consts[fnh_register]);
-      const int index = tl_set_name_ex(TL, tlbc_arg(code), TL->stack + pos);
-      TL->stack[pos].carrier = (TLPathInfo){.index = index, .up = 0};
+      // const int pos = tl_push(TL, TL->global->consts[fnh_register]);
+      tl_set_name_ex(
+        TL, tlbc_arg(code),
+        TL->global->consts[fnh_register]
+      );
+      _tl_hold(TL->global, TL->global->consts[fnh_register]);
       fnh_register = -1;
       do
         code = bc[TL->bc_pos++];
@@ -106,6 +109,10 @@ int tl_run_bytecode_ex(TLScope *TL, tl_object_t scope, int depth,
       for (int i = 0; i < tlbc_arg(code); i++)
         tl_pop(TL);
       break;
+    case TLOP_EOS:
+      while (TL->stack_top > 0)
+        tl_pop(TL);
+      break;
     case TLOP_COPY_CONST:
       assert(TL->stack_top < TL->stack_cap);
       _tl_hold(TL->global, TL->global->consts[tlbc_arg(code)]);
@@ -131,6 +138,8 @@ int tl_run_bytecode_ex(TLScope *TL, tl_object_t scope, int depth,
             (TLPathInfo){.index = tlbc_arg(code), .up = 0};
         param_count--;
       }
+      puts("=== POST ===");
+      tl_fdebug_scope(stdout, TL);
       break;
     case TLOP_COND: {
       if (tlbc_arg(code) == depth) {
@@ -166,6 +175,7 @@ int tl_run_bytecode_ex(TLScope *TL, tl_object_t scope, int depth,
         if (tlbc_arg(code) == TLOP_END)
           depth--;
       }
+      tl_pop(TL); // pop boolean
       break;
     }
     case TLOP_ELSE:
@@ -196,6 +206,7 @@ int tl_run_bytecode_ex(TLScope *TL, tl_object_t scope, int depth,
         if (tlbc_arg(code) == TLOP_END)
           depth--;
       }
+      tl_pop(TL); // pop boolean
       break;
     }
     case TLOP_BREAK:
