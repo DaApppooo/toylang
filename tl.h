@@ -32,26 +32,64 @@
 char* _tl_str_clone(const char* const s);
 int _tl_str_len(const char* const s);
 bool _tl_str_eq(const char* s1, const char* s2);
+void _tl_strn_from_int(char* buf, int64_t val, int n);
 struct TLScope;
 typedef void* tl_object_t;
 typedef int(*tl_cfunc_ptr_t)(struct TLScope*, int argc);
 
+/*
+  WARNING: TL_CUSTOM objects must have their first bytes be:
+    TLType type = TL_CUSTOM;
+    <! NO PADDING !>
+    int registered_info_function;
+    ... other bytes of the custom type ...
+
+  The 'registered_info_function' is the index in the constants of the state of
+  a function (or anything that's builtin callable) which takes two parameters:
+    1. The object from which ToyLang wishes to recover information from.
+    2. The info asked by ToyLand. Can be only one at a time, and only one of:
+      - TL_MSG_NAME
+        Must return a TL_STR which contains the name of the custom type.
+        This is used by the "is" operator and tl_type_to_str().
+      - TL_MSG_SIZEOF
+        Must return a TL_INT (64 bit signed int) containing the size in bytes
+        of the custom type. Only used by tl_size_of().
+      - TL_MSG_COPY
+        Can return any tl_object. It will then be moved and _tl_hold() to the
+        correct location.
+      - TL_MSG_REPR
+        Must return a TL_STR which contains the code representation of the data
+        stored in the type. For hidden type - which I strongly discourage - you
+        can return a static string stored in a TL_STR via tl_push_rstr().
+      - TL_MSG_DESTROY
+        The function must handle all destroying of the type. Including freeing
+        the tl_objec_t pointer.
+  All five must be declared. In case you don't want to bother writing all of
+  them or if any doesn't make sense in your context, you can just return nil,
+  in which case a default value will be returned. Note that this can become an
+  issue with 'TL_MSG_SIZEOF' if any other custom type depends on the size of
+  your object (the default value being 0). The minimum required is
+  TL_MSG_DESTROY, or else memory leaks can occur.
+*/
 typedef enum TLType : uint8_t
 {
-  TL_NIL, TL_INT, TL_FLOAT, TL_BOOL, TL_STR, TL_LIST, TL_FUNC, TL_CFUNC,
-  TL_CUSTOM
+  TL_NIL, TL_INT, TL_FLOAT, TL_BOOL, TL_STR, TL_FUNC, TL_CFUNC,
+  TL_SCOPE, TL_CUSTOM
 } TLType;
+typedef enum TLMSGType : int64_t
+{
+  TL_MSG_NAME = 0,
+  TL_MSG_SIZEOF = 1,
+  TL_MSG_COPY = 2,
+  TL_MSG_REPR = 3,
+  TL_MSG_DESTROY = 4
+} TLMSGType;
 typedef struct TLName
 {
   // char name[MAX_NAME_LENGTH];
   tl_object_t data;
   int global_str_idx;
 } TLName;
-typedef struct
-{
-  uint16_t index;
-  uint8_t up; // go up 'up' times in the TLState tree
-} TLPathInfo;
 
 // These are containers used to ease the interpreter's interaction with objects
 #define _TL_VIRT __attribute__((packed, aligned(1)))
@@ -102,15 +140,23 @@ typedef struct
 typedef struct
 {
   TLType type;
-  struct TLState* child;
   uint8_t prec;
   int argc;
   int bytecode_pt;
 } _TL_VIRT _TLFunc;
+typedef struct
+{
+  TLType type;
+  struct TLScope* scope;
+} _TL_VIRT _TLScope;
+typedef struct
+{
+  TLType type;
+  int info_func;} _TL_VIRT _TLCustom;
 typedef struct TLData
 {
   tl_object_t object;
-  TLPathInfo carrier; // associated name, if any
+  TLName* ref; // associated name, if any
 } TLData;
 struct TLState;
 typedef struct TLScope
@@ -140,17 +186,13 @@ typedef struct TLState
   int bc_cap;
 } TLState;
 
-#define DEFAULT_STACK_CAP 25
+#define DEFAULT_STACK_CAP 64
 #define DEFAULT_MAX_NAME_COUNT 128
 #define TL_INVALID_PATH (TLPathInfo){.index=0, .up=UINT8_MAX}
 
 
 // === state and scope management ===
 
-static inline bool tl_is_valid_path(TLPathInfo pi)
-{
-  return pi.up < UINT8_MAX;
-}
 TLScope* tl_new_scope_ex(
   TLState* state,
   TLScope* parent,
@@ -162,9 +204,9 @@ TLState* tl_new_state();
 void tl_load_openlib(TLState* TL);
 void tl_destroy(TLState* TL);
 void tl_destroy_scope(TLScope* TL);
+void tl_destroy_object(TLScope* S, tl_object_t obj);
+void tl_destroy_custom(TLScope* S, tl_object_t custom);
 TLScope* tl_scope_walk_path(TLScope* sc, int up);
-TLType tl_type_of(tl_object_t obj);
-uint64_t tl_size_of(tl_object_t obj);
 
 // === gc management ===
 void _tl_hold(TLState* TL, tl_object_t obj);
@@ -180,13 +222,11 @@ void tl_register_func(
 int _tl_op_call(TLScope* S, int argc);
 
 // === names ===
-TLPathInfo _tl_piname(TLScope* TL, const char* name);
 const char* tl_name_to_str(TLScope* TL, int idx);
-TLName* tl_name_walk_path(TLScope* TL, TLPathInfo path);
 // Creates name if it doesn't exist. Should never returns NULL.
 TLName* tl_get_name_ex(TLScope* TL, int global_stack_str_index);
-// Creates name if it doesn't exist. Should never returns NULL.
 TLName* tl_get_name(TLScope* TL, const char* s);
+TLName* tl_get_local(TLScope* TL, const char* s);
 // Doesn't create the name. Returns NULL if the name doesn't exist.
 TLName* tl_has_name_ex(TLScope* TL, int global_stack_str_index);
 // Returns name index (used in bytecode)
@@ -194,13 +234,6 @@ int tl_set_name_ex(TLScope* TL, int global_str_name, tl_object_t object);
 int tl_set_name(TLScope* TL, const char* name, tl_object_t object);
 void tl_copy_name_ex(TLScope* TL, int global_str_name);
 void tl_copy_name(TLScope* TL, const char* name);
-static inline int tl_push(TLScope* TL, tl_object_t obj)
-{
-  assert(TL->stack_top < TL->stack_cap);
-  TL->stack[TL->stack_top].object = obj;
-  TL->stack[TL->stack_top++].carrier = TL_INVALID_PATH;
-  return TL->stack_top-1;
-}
 
 
 // === stack values ===
@@ -221,65 +254,95 @@ static inline TLData* tl_top_ex(TLScope* S)
 { return &(S->stack[S->stack_top-1]); }
 static inline tl_object_t tl_top(TLScope* S)
 { return tl_top_ex(S)->object; }
-bool tl_top_to_bool(TLScope* S);
-static inline int64_t tl_to_int(tl_object_t obj)
-{ assert(tl_type_of(obj) == TL_INT); return ((_TLInt*)obj)->value; }
-static inline double tl_to_float(tl_object_t obj)
-{ assert(tl_type_of(obj) == TL_FLOAT); return ((_TLFloat*)obj)->value; }
-static inline int tl_precedence(tl_object_t object)
+// Most of these function work with the value put on top of the stack
+TLType tl_type_of_pro(tl_object_t obj);
+static inline TLType tl_type_of_ex(TLScope* S, int index)
+{ return tl_type_of_pro(tl_get(S, index)); }
+static inline TLType tl_type_of(TLScope* S)
+{ return tl_type_of_pro(tl_top(S)); }
+uint64_t tl_size_of_pro(TLScope* S, tl_object_t obj);
+static inline uint64_t tl_size_of_ex(TLScope* S, int index)
+{ return tl_size_of_pro(S, tl_get(S, index)); }
+static inline uint64_t tl_size_of(TLScope* S)
+{ return tl_size_of_pro(S, tl_top(S)); }
+bool tl_to_bool(TLScope* S);
+static inline int64_t tl_to_int_pro(tl_object_t obj)
+{ assert(tl_type_of_pro(obj) == TL_INT);
+  return ((_TLInt*)obj)->value; }
+static inline double tl_to_float_pro(tl_object_t obj)
+{ assert(tl_type_of_pro(obj) == TL_FLOAT);
+  return ((_TLFloat*)obj)->value; }
+static inline int tl_precedence_pro(tl_object_t obj)
 {
-  assert(tl_type_of(object) == TL_FUNC || tl_type_of(object) == TL_CFUNC);
-  if (tl_type_of(object) == TL_FUNC)
-    return ((_TLFunc*)object)->prec;
+  assert(tl_type_of_pro(obj) == TL_FUNC || tl_type_of_pro(obj) == TL_CFUNC);
+  if (tl_type_of_pro(obj) == TL_FUNC)
+    return ((_TLFunc*)obj)->prec;
   else
-    return ((_TLCFunc*)object)->prec;
+    return ((_TLCFunc*)obj)->prec;
 }
-static inline int tl_argc(tl_object_t object)
+static inline int tl_argc_pro(tl_object_t obj)
 {
-  assert(tl_type_of(object) == TL_FUNC || tl_type_of(object) == TL_CFUNC);
-  if (tl_type_of(object) == TL_FUNC)
-    return ((_TLFunc*)object)->argc;
+  assert(tl_type_of_pro(obj) == TL_FUNC || tl_type_of_pro(obj) == TL_CFUNC);
+  if (tl_type_of_pro(obj) == TL_FUNC)
+    return ((_TLFunc*)obj)->argc;
   else
-    return ((_TLCFunc*)object)->argc;
+    return ((_TLCFunc*)obj)->argc;
 }
-static inline const char* tl_to_str(tl_object_t obj)
+static inline char* tl_to_str_pro(tl_object_t obj)
 {
-  assert(tl_type_of(obj) == TL_STR);
-  // if (((_TLStr*)obj)->owned)
-  return (char*)(((_TLStr*)obj)+1);
-  // else
-  //   return *(char**)(((_TLStr*)obj)+1);
+  assert(tl_type_of_pro(obj) == TL_STR);
+  if (((_TLStr*)obj)->owned)
+    return (char*)(((_TLStr*)obj)+1);
+  else
+    return *(char**)(((_TLStr*)obj)+1);
 }
-static inline bool tl_to_bool(tl_object_t obj)
+static inline TLScope* tl_to_scope_pro(tl_object_t obj)
 {
-  assert(tl_type_of(obj) == TL_BOOL);
-  return ((_TLBool*)obj)->value;
+  assert(tl_type_of_pro(obj) == TL_SCOPE);
+  return ((_TLScope*)obj)->scope;
 }
-
-static inline const char* tl_type_to_str(TLType type)
-{
-  const char* TABLE[TL_CUSTOM+1] = {
-    "nil", "int", "float", "bool", "str", "list", "function", "cfunction",
-    "custom"
-  };
-  return TABLE[type];
-}
+#define TO_T_EX(CT, T) \
+static inline CT tl_to_##T##_ex(TLScope* S, int index) \
+{ return tl_to_##T##_pro(tl_get(S, index)); }
+#define TO_T_EZ(CT, T) \
+static inline CT tl_to_##T (TLScope* S) \
+{ return tl_to_##T##_pro(tl_top(S)); }
+#define TO_T(CT, T) \
+TO_T_EX(CT, T) \
+TO_T_EZ(CT, T)
+TO_T(int64_t, int);
+TO_T(double, float);
+TO_T(char*, str);
+#undef TO_T_EX
+#undef TO_T_EZ
+#undef TO_T
+void tl_push_type_name(TLScope* S, TLType type);
+// push onto the stack the return value, except for TL_MSG_DESTROY
+void tl_custom_info(TLScope* S, TLMSGType msg);
 
 //  == setters ==
 
+static inline int tl_push(TLScope* TL, tl_object_t obj)
+{
+  assert(TL->stack_top < TL->stack_cap);
+  _tl_hold(TL->global, obj);
+  TL->stack[TL->stack_top].object = obj;
+  TL->stack[TL->stack_top++].ref = NULL;
+  return TL->stack_top-1;
+}
 void tl_pop(TLScope* TL);
 int tl_push_int_ex(TLScope* TL, int64_t value);
 int tl_push_str_ex(TLScope *TL, const char *value);
 int tl_push_float_ex(TLScope* TL, double value);
 int tl_push_bool_ex(TLScope *TL, bool value);
 // String can always be referenced as long as the state is alive
-tl_object_t tl_push_rstr(TLState* TL, char* ref_value);
+tl_object_t tl_push_rstr(TLScope* TL, const char* ref_value);
 // Takes ownership of the given string.
 // Use tl_push_strcpy to let the state take ownership of the string by itself.
 static inline tl_object_t tl_push_nil(TLScope* TL)
 {
   assert(TL->stack_top < TL->stack_cap);
-  TL->stack[TL->stack_top].carrier = TL_INVALID_PATH;
+  TL->stack[TL->stack_top].ref = NULL;
   TL->stack[TL->stack_top++].object = NULL;
   return NULL;
 }
@@ -291,8 +354,6 @@ static inline tl_object_t tl_push_int(TLScope* TL, int64_t value)
 { return TL->stack[tl_push_int_ex(TL, value)].object; }
 static inline tl_object_t tl_push_bool(TLScope* TL, bool value)
 { return TL->stack[tl_push_bool_ex(TL, value)].object; }
-tl_object_t tl_begin_list(TLScope* TL);
-tl_object_t tl_end_list(TLScope* TL);
 
 
 // === debug stuff ===
@@ -352,6 +413,9 @@ typedef enum : uint8_t
   TLOP_CONTINUE, // continue
   TLOP_RET, // ret <count>
   TLOP_END, // end <depth>
+  TLOP_LB, // lb <length_until_next_comma> // List Begin
+  TLOP_LC, // lc <length> // List Comma
+  TLOP_LE, // le // List End
   TLOP_EOS, // eos // End Of Statement,
                    // avoid overflowing the stack with unused returned value
                    // put between statements
@@ -364,7 +428,7 @@ static inline uint32_t tlbc_arg(uint64_t unit)
 void tl_run_bytecode(TLState* TL);
 int tl_run_bytecode_ex(
   TLScope* TL,
-  tl_object_t scope,
+  int length,
   int depth,
   int param_count
 );
@@ -402,12 +466,14 @@ typedef enum TokenType : uint8_t
   TOK_NAME, // <name_index>
   TOK_OP, // <name_index> 
   TOK_INT, // <stack_index>
-  // once a dot has been detected, TOK_INT becomes TOK_FLOAT
   TOK_FLOAT, // <stack_index>
   TOK_STR, // <stack_index>
   TOK_COMMA,
   TOK_PARENTH, // <length until ')' (in tokens)>
+  TOK_BRACKET, // <length until ']' (in tokens)>
   TOK_CALL, // special token to indicate function call
+  TOK_INDEX, // special token to indicate indexing
+  TOK_LC, // 'lc' instruction
   
   TOK_FN, // <name_index>
   TOK_IF, // becomes TLOP_COND

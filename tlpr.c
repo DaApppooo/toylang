@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#define PLS_MAX 256
 
 bool isoperator(int c)
 {
@@ -37,9 +38,9 @@ int find_string_global(TLState* TL, const char* s)
 {
   for (int i = 0; i < TL->consts_len; i++)
   {
-    if (tl_type_of(TL->consts[i]) == TL_STR)
+    if (tl_type_of_pro(TL->consts[i]) == TL_STR)
     {
-      if (_tl_str_eq(tl_to_str(TL->consts[i]), s))
+      if (_tl_str_eq(tl_to_str_pro(TL->consts[i]), s))
       {
         return i;
       }
@@ -61,7 +62,7 @@ int int_const_from(TLState* TL, const char* s)
 int float_const_from(TLState* TL, const char* s)
 {
   _TLFloat* i = TL_MALLOC(sizeof(_TLFloat));
-  i->type = TL_INT;
+  i->type = TL_FLOAT;
   i->value = atof(s);
   return _tl_consts_push(TL, i);
 }
@@ -86,7 +87,7 @@ bool _tl_token_push(
   assert(out->toksi < TOKEN_STACK_MAX);
   btok[*btoki] = 0;
   bool stop_tokenizing = false;
-  printf("PUSH [%s] (type=%i)\n", btok, *current);
+  // printf("PUSH [%s] (type=%i)\n", btok, *current);
   switch (*current)
   {
   case TOK_FN:
@@ -101,6 +102,8 @@ bool _tl_token_push(
   case TOK_RETURN:
   case TOK_ELSE:
   case TOK_CALL:
+  case TOK_INDEX:
+  case TOK_LC:
     assert(false);
     break;
   case TOK_NOTHING:
@@ -164,10 +167,10 @@ bool _tl_token_push(
       const TLName* name = tl_get_name_ex(TL->scope, i);
       if (name)
       {
-        const TLType type = tl_type_of(name->data);
+        const TLType type = tl_type_of_pro(name->data);
         if (type == TL_FUNC || type == TL_CFUNC)
         {
-          const uint8_t prec = tl_precedence(name->data);
+          const uint8_t prec = tl_precedence_pro(name->data);
           if (prec > out->max_prec)
             out->max_prec = prec;
         }
@@ -175,14 +178,15 @@ bool _tl_token_push(
       break;
     }
   case TOK_PARENTH:
+  case TOK_BRACKET:
     {
-      if (btok[0] == ')')
+      if (btok[0] == ')' || btok[0] == ']')
       {
         int j;
         for (j = 0; j < out->toksi; j++)
         {
           if (
-             out->toks[out->toksi-j-1].type == TOK_PARENTH
+             out->toks[out->toksi-j-1].type == *current
           && out->toks[out->toksi-j-1].arg == UNSET_PARENTH
           ) {
             out->toks[out->toksi-j-1].arg = j;
@@ -252,6 +256,7 @@ bool is_single_token(TokenType t)
   return (
      t == TOK_PARENTH
   || t == TOK_COMMA
+  || t == TOK_BRACKET
   );
 }
 TokenizerOut tl_tokenize_string(TLState *G, TokenizerState* TS, char *code)
@@ -271,7 +276,7 @@ TokenizerOut tl_tokenize_string(TLState *G, TokenizerState* TS, char *code)
     c = code[TS->i];
     if (c == '\n' || c == ';')
     {
-      if (depth == 0 || (depth == 1 && btok[0] == ')'))
+      if (depth == 0 || (depth == 1 && (btok[0] == ')' || btok[0] == ']')))
         goto FINISH;
       else continue;
     }
@@ -308,13 +313,26 @@ TokenizerOut tl_tokenize_string(TLState *G, TokenizerState* TS, char *code)
       ctt = TOK_NAME;
     }
     else if (isoperator(c))
-      ctt = TOK_OP;
+    {
+      if (current == TOK_INT && c == '.')
+      {
+        current = TOK_FLOAT;
+        ctt = TOK_FLOAT;
+      }
+      else
+        ctt = TOK_OP;
+    }
     else if (isnum(c))
     {
       if (current == TOK_NAME)
         ctt = TOK_NAME;
       else if (current == TOK_FLOAT)
         ctt = TOK_FLOAT;
+      else if (btoki > 1 && btok[btoki-1] == '.' && current == TOK_OP)
+      {
+        current = TOK_FLOAT;
+        ctt = TOK_FLOAT;
+      }
       else
         ctt = TOK_INT;
     }
@@ -323,6 +341,10 @@ TokenizerOut tl_tokenize_string(TLState *G, TokenizerState* TS, char *code)
       ctt = TOK_PARENTH;
       if (out.toksi > 2 && out.toks[0].type == TOK_FN && c == ')')
         goto FINISH;
+    }
+    else if (c == '[' || c == ']')
+    {
+      ctt = TOK_BRACKET;
     }
     else if (c == ' ' || c == '\t')
       ctt = TOK_NOTHING;
@@ -386,23 +408,77 @@ void _bc_push(TLState* G, uint32_t code)
   G->bc[G->bc_len-1] = code;
 }
 
+static inline bool tok_is_brace(Token tok)
+{ return tok.type == TOK_PARENTH || tok.type == TOK_BRACKET; }
+typedef enum BraceType
+{
+  PARENTHESIS,
+  BRACKET
+} BraceType;
+typedef struct BraceInfo
+{
+  BraceType type;
+  int pos;
+} BraceInfo;
+typedef struct BraceManager
+{
+  BraceInfo infos[PLS_MAX];
+  int len;
+} BraceManager;
+BraceManager init_brace_management()
+{
+  BraceManager ret;
+  ret.len = 0;
+  return ret;
+}
+void update_brace_manager(BraceManager* self, Token* T,
+                          Token current_token, int i)
+{
+  while (self->len > 0 && self->infos[self->len-1].pos + T[self->infos[self->len-1].pos].arg < i)
+    self->len--;
+}
+void update_debug_brace_manager(BraceManager* self, Token* T,
+                                Token current_token, int i)
+{
+  while (self->len > 0 && self->infos[self->len-1].pos + T[self->infos[self->len-1].pos].arg < i)
+  {
+    self->len--;
+    if (self->infos[self->len].type == PARENTHESIS)
+      printf(" ) ");
+    else if (self->infos[self->len].type == BRACKET)
+      printf(" ] ");
+    else
+      assert(false);
+  }
+}
+int current_depth(BraceManager* self)
+{ return self->len; }
+void push_brace(BraceManager* self, Token tok, int pos)
+{
+  BraceType type;
+  if (tok.type == TOK_PARENTH)
+    type = PARENTHESIS;
+  else if (tok.type == TOK_BRACKET)
+    type = BRACKET;
+  else
+    assert(false);
+  self->infos[self->len++] = (BraceInfo){.type=type, .pos=pos};
+}
+
 int tl_expr_to_rpn(
   TLState* G,
   TokenizerOut* toks,
   int start, int len)
 {
-  printf("[%i to %i]\n", start, start+len);
+  // printf("[%i to %i]\n", start, start+len);
   Token* T = toks->toks+start;
   const int initial_len = len;
-  const int PLS_MAX = 256;
-  // parenthesis lengths (stack)
-  int pls[PLS_MAX];
-  int pls_len;
+  BraceManager bm;
   for (int depth = toks->max_depth; depth >= 0; depth--)
   {
-    pls_len = 0;
     for (int prec = toks->max_prec; prec >= 0; prec--)
     {
+      bm = init_brace_management();
       for (int i = 0; i < len; i++)
       {
         if (T[i].rpned != 0)
@@ -410,133 +486,195 @@ int tl_expr_to_rpn(
           i += T[i].rpned - 1;
           continue;
         }
-        printf("BEFORE: (depth=%i/%i, prec=%i/%i)\n",
-               depth, toks->max_depth,
-               prec, toks->max_prec);
-        tl_debug_token_array(G, T, len, i);
-        while (pls_len > 0 && pls[pls_len-1] + T[pls[pls_len-1]].arg < i)
-          pls_len--;
-        if (T[i].type == TOK_PARENTH)
+        // printf("BEFORE: (depth=%i/%i, prec=%i/%i)\n",
+        //        depth, toks->max_depth,
+        //        prec, toks->max_prec);
+        // tl_debug_token_array(G, T, len, i);
+        update_brace_manager(&bm, T, T[i], i);
+        if (tok_is_brace(T[i]) && depth-1 == current_depth(&bm))
         {
-          if (depth-1 == pls_len)
-          {
-            if (i > 0
-                && (
-                  (
-                     T[i-1].type != TOK_OP
-                  && T[i-1].type != TOK_PARENTH
-                  )
-                || T[i-1].rpned > 0
+          if (i > 0
+              && (
+                (
+                   T[i-1].type != TOK_OP
+                && T[i-1].type != TOK_PARENTH
+                && T[i-1].type != TOK_BRACKET
                 )
-            ) {
-              // Call
-              // f ( a , b ) -> a b f ()
-              // {(f + g)(a, b) ->} f g + ( a , b ) -> a b f g + ()
-              if (T[i-1].rpned == 0)
-                T[i-1].rpned = 1;
-              
-              // currently: f g + ( a b + , c
-              if (T[i].arg == 0)
+              || T[i-1].rpned > 0
+              )
+          ) {
+            TokenType call_type;
+            if (T[i].type == TOK_PARENTH)
+              call_type = TOK_CALL;
+            else if (T[i].type == TOK_BRACKET)
+              call_type = TOK_INDEX;
+            else
+              assert(false);
+            // Call
+            // f ( a , b ) -> a b f ()
+            // {(f + g)(a, b) ->} f g + ( a , b ) -> a b f g + ()
+            if (T[i-1].rpned == 0)
+              T[i-1].rpned = 1;
+            
+            // currently: f g + ( a b + , c
+            if (T[i].arg == 0)
+            {
+              // f g + (
+              // ^-+-+-+
+              // +-+-+-^
+              T[i-T[i-1].rpned].rpned = T[i-1].rpned+1;
+              T[i].rpned = T[i-1].rpned+1;
+              T[i].op_argc = 1; // 1 for the function being called
+              T[i].type = call_type;
+              continue;
+            }
+            int argc = 1;
+            int param_start = 0;
+            toks->max_depth -= depth;
+            {
+              for (int param_tok = 0; param_tok < T[i].arg; param_tok++)
               {
-                // f g + (
-                // ^-+-+-+
-                // +-+-+-^
-                T[i-T[i-1].rpned].rpned = T[i-1].rpned+1;
-                T[i].rpned = T[i-1].rpned+1;
-                T[i].op_argc = 1; // 1 for the function being called
-                T[i].type = TOK_CALL;
-                continue;
+                update_brace_manager(
+                  &bm, T, T[i+param_tok+1],
+                  i+param_tok+1
+                );
+                if (tok_is_brace(T[i+param_tok+1]))
+                  push_brace(&bm, T[i+param_tok+1], i+param_tok+1);
+                else if (
+                   T[i+param_tok+1].type == TOK_COMMA
+                && depth-1 == current_depth(&bm)
+                ) {
+                  const int rdux = tl_expr_to_rpn(
+                     G, toks,
+                     i+param_start+1 + start,
+                     param_tok-param_start
+                  );
+                  len -= rdux;
+                  T[i].arg -= rdux;
+                  param_start = param_tok;
+                  argc++;
+                }
               }
-              int argc = 1;
-              int param_start = 0;
-              toks->max_depth -= depth;
-              {
-                for (int param_tok = 0; param_tok < T[i].arg; param_tok++)
+              const int rdux = tl_expr_to_rpn(
+                 G, toks,
+                 i+param_start+1 + start,
+                 T[i].arg-param_start
+              );
+              len -= rdux;
+              T[i].arg -= rdux;
+            }
+            toks->max_depth += depth;
+            // currently: f g + ( a b + , c
+            // move over the parenthesis
+            Token parenth = T[i];
+            parenth.type = call_type;
+            memmove(T+i, T+i+1, parenth.arg*sizeof(Token));
+            T[i+parenth.arg] = parenth;
+            // currently: f g + a b + , c (
+            //                  [-------]    << temp.arg
+            //                  ^            << i
+            //            [---]              << T[i-1].rpned
+            // goal:      a b + , c f g + (
+            const int to_move = T[i-1].rpned;
+            for (int imove = 0; imove < to_move; imove++)
+            {
+              //          f g + a b + , c (
+              // imove=0: f g a b + , c + (
+              // imove=1: f a b + , c g + (
+              // imove=2: a b + , c f g + (
+              Token temp = T[i-imove-1];
+              memmove(T+i-imove-1, T+i-imove, parenth.arg*sizeof(Token));
+              T[i+parenth.arg-imove-1] = temp;
+            }
+            // Finally, set .rpned and arg count
+            T[i+parenth.arg].rpned = to_move + parenth.arg + 1;
+            T[i+parenth.arg].op_argc = argc+1;
+            T[i-to_move].rpned = to_move + parenth.arg + 1;
+          }
+          else if (T[i].type == TOK_PARENTH)
+          {
+            toks->max_depth -= depth;
+            const int rdux = tl_expr_to_rpn(G, toks, i+1+start, T[i].arg);
+            len -= rdux;
+            if (T[i+1].rpned)
+            {
+              T[i].rpned = T[i+1].rpned+1;
+              T[i+T[i].rpned-1].rpned = T[i].rpned;
+            }
+            toks->max_depth += depth;
+          }
+          else if (T[i].type == TOK_BRACKET)
+          {
+            if (T[i].arg == 0)
+            {
+              T[i].rpned = 1;
+              continue;
+            }
+            const int list_len = T[i].arg;
+            int elem_start = 0;
+            for (int j = 0; j < list_len; j++)
+            {
+              update_brace_manager(
+                &bm, T, T[i+j+1],
+                i+j+1
+              );
+              if (tok_is_brace(T[i+j+1]))
+                push_brace(&bm, T[i+j+1], i+j+1);
+              else if (
+                 T[i+j+1].type == TOK_COMMA
+              && depth-1 == current_depth(&bm)
+              ) {
+                if (T[i].arg == list_len)
+                  T[i].arg = j - elem_start;
+                else
                 {
-                  if (T[i+param_tok+1].type == TOK_COMMA)
-                  {
-                    const int rdux = tl_expr_to_rpn(
-                       G, toks,
-                       i+param_start+1 + start,
-                       param_tok-param_start
-                    );
-                    len -= rdux;
-                    T[i].arg -= rdux;
-                    param_start = param_tok;
-                    argc++;
-                  }
+                  T[i+elem_start+1].type = TOK_LC;
+                  T[i+elem_start+1].arg = j - elem_start;
                 }
                 const int rdux = tl_expr_to_rpn(
                    G, toks,
-                   i+param_start+1 + start,
-                   T[i].arg-param_start
+                   i+elem_start+1 + start,
+                   j-elem_start
                 );
                 len -= rdux;
-                T[i].arg -= rdux;
+                elem_start = j;
               }
-              toks->max_depth += depth;
-              // currently: f g + ( a b + , c
-              // move over the parenthesis
-              Token parenth = T[i];
-              parenth.type = TOK_CALL;
-              memmove(T+i, T+i+1, parenth.arg*sizeof(Token));
-              T[i+parenth.arg] = parenth;
-              // currently: f g + a b + , c (
-              //                  [-------]    << temp.arg
-              //                  ^            << i
-              //            [---]              << T[i-1].rpned
-              // goal:      a b + , c f g + (
-              const int to_move = T[i-1].rpned;
-              for (int imove = 0; imove < to_move; imove++)
-              {
-                //          f g + a b + , c (
-                // imove=0: f g a b + , c + (
-                // imove=1: f a b + , c g + (
-                // imove=2: a b + , c f g + (
-                Token temp = T[i-imove-1];
-                memmove(T+i-imove-1, T+i-imove, parenth.arg*sizeof(Token));
-                T[i+parenth.arg-imove-1] = temp;
-              }
-              // Finally, set .rpned and arg count
-              T[i+parenth.arg].rpned = to_move + parenth.arg + 1;
-              T[i+parenth.arg].op_argc = argc+1;
-              T[i-to_move].rpned = to_move + parenth.arg + 1;
             }
-            else
+            if (T[i].arg != list_len)
             {
-              toks->max_depth -= depth;
-              const int rdux = tl_expr_to_rpn(G, toks, i+1+start, T[i].arg);
-              len -= rdux;
-              if (T[i+1].rpned)
-              {
-                T[i].rpned = T[i+1].rpned+1;
-                T[i+T[i].rpned-1].rpned = T[i].rpned;
-              }
-              toks->max_depth += depth;
+              T[i+elem_start+1].type = TOK_LC;
+              T[i+elem_start+1].arg = list_len - elem_start;
             }
+            const int rdux = tl_expr_to_rpn(
+               G, toks,
+               i+elem_start+1 + start,
+               list_len-elem_start
+            );
+            T[i].rpned = list_len+1;
+            T[i+T[i].rpned].rpned = list_len+1;
+            len -= rdux;
           }
           else
-          {
-            assert(pls_len < PLS_MAX);
-            pls[pls_len++] = i;
-          }
+            assert(false);
         }
-        else if (depth == pls_len)
+        else if (tok_is_brace(T[i]))
+          push_brace(&bm, T[i], i);
+        else if (depth == current_depth(&bm))
         {
           const TLName* name = tl_has_name_ex(G->scope, T[i].arg);
           tl_object_t* op = name ? name->data : NULL;
-          if (T[i].type == TOK_OP && tl_type_of(op) == TL_NIL)
+          if (T[i].type == TOK_OP && tl_type_of_pro(op) == TL_NIL)
           {
             fprintf(
               stderr,
               "ERROR: Use of undeclared operator '%s'.\n",
-              tl_to_str(G->consts[T[i].arg])
+              tl_to_str_pro(G->consts[T[i].arg])
             );
             return 0;
           }
           if (
              T[i].type == TOK_OP
-          && tl_precedence(op) == prec
+          && tl_precedence_pro(op) == prec
           ) {
             if (i == 0 || (T[i-1].rpned == 0 && T[i-1].type == TOK_OP))
             {
@@ -569,38 +707,12 @@ int tl_expr_to_rpn(
             }
           }
         }
-        printf("AFTER: (depth=%i/%i, prec=%i/%i)\n",
-               depth, toks->max_depth,
-               prec, toks->max_prec);
-        tl_debug_token_array(G, T, len, i);
+        // printf("AFTER: (depth=%i/%i, prec=%i/%i)\n",
+        //        depth, toks->max_depth,
+        //        prec, toks->max_prec);
+        // tl_debug_token_array(G, T, len, i);
       }
     }
-    // Remove parenthesis of done depth
-    // int offset = 0;
-    // pls_len = 0;
-    // for (int i = 0; i < len; i++)
-    // {
-    //   while (pls_len > 0 && pls[pls_len-1] + T[pls[pls_len-1]].arg < i)
-    //     pls_len--;
-    //   if (T[i].type == TOK_PARENTH)
-    //   {
-    //     if (pls_len == depth)
-    //     {
-    //       offset++;
-    //       len--;
-    //       for (int j = 0; j < pls_len; j++)
-    //       {
-    //         T[pls[j]].arg--;
-    //       }
-    //     }
-    //     else
-    //     {
-    //       assert(pls_len < PLS_MAX);
-    //       pls[pls_len++] = i;
-    //     }
-    //   }
-    //   T[i] = T[i+offset];
-    // }
   }
   return initial_len - len;
 }
@@ -608,15 +720,10 @@ void tl_debug_token_array(
   TLState* TL,
   Token *a, int len, int current)
 {
-  int par[64];
-  int pls = 0;
+  BraceManager bm = init_brace_management();
   for (int i = 0; i < len; i++)
   {
-    while (pls > 0 && par[pls-1] + a[par[pls-1]].arg < i)
-    {
-      printf(" ) ");
-      pls--;
-    }
+    update_debug_brace_manager(&bm, a, a[i], i);
     if (i == current)
     { printf(" {"); }
     if (a[i].rpned)
@@ -627,15 +734,15 @@ void tl_debug_token_array(
     {
       case TOK_NAME:
       case TOK_OP:
-        printf("%s ", tl_to_str(TL->consts[a[i].arg]));
+        printf("%s ", tl_to_str_pro(TL->consts[a[i].arg]));
         break;
       case TOK_BREAK: printf("break "); break;
       case TOK_CONTINUE: printf("continue "); break;
       case TOK_COMMA: printf(", "); break;
       case TOK_IF: printf("if "); break;
       case TOK_ELIF: printf("elif "); break;
-      case TOK_FLOAT: printf("%lf ", tl_to_float(TL->consts[a[i].arg])); break;
-      case TOK_INT: printf("%li ", tl_to_int(TL->consts[a[i].arg])); break;
+      case TOK_FLOAT: printf("%lf ", tl_to_float_pro(TL->consts[a[i].arg])); break;
+      case TOK_INT: printf("%li ", tl_to_int_pro(TL->consts[a[i].arg])); break;
       case TOK_NOTHING: printf("(/) "); break;
       case TOK_FN: printf("fn "); break;
       case TOK_CALL: printf("<call> "); break;
@@ -645,11 +752,17 @@ void tl_debug_token_array(
       case TOK_THEN: printf("then "); break;
       case TOK_WHILE: printf("while "); break;
       case TOK_RETURN: printf("return "); break;
-      case TOK_STR: printf("(str)[%s]", tl_to_str(TL->consts[a[i].arg])); break;
+      case TOK_STR: printf("(str)[%s]", tl_to_str_pro(TL->consts[a[i].arg])); break;
       case TOK_PARENTH:
         printf("[%i]( ", a[i].arg);
-        par[pls++] = i;
+        push_brace(&bm, a[i], i);
         break;
+      case TOK_BRACKET:
+        printf("[%i][ ", a[i].arg);
+        push_brace(&bm, a[i], i);
+        break;
+      case TOK_INDEX: printf("<index> "); break;
+      case TOK_LC: printf("<lc> "); break;
     }
     if (i == current)
     { printf("} "); }
@@ -658,8 +771,15 @@ void tl_debug_token_array(
 }
 void tl_rpn_to_bytecode(TLState* G, TokenizerOut* rpn, int start, int len)
 {
+  int bra[64];
+  int bls = 0;
   for (int i = start; i < start+len; i++)
   {
+    while (bls > 0 && bra[bls-1] + rpn->toks[bra[bls-1]].arg < i)
+    {
+      bls--;
+      _bc_push(G, CODE(TLOP_LE, 0));
+    }
     if (rpn->toks[i].type == TOK_NAME || rpn->toks[i].type == TOK_OP)
     {
       _bc_push(G, CODE(TLOP_COPY_NAME, rpn->toks[i].arg));
@@ -672,6 +792,21 @@ void tl_rpn_to_bytecode(TLState* G, TokenizerOut* rpn, int start, int len)
       _bc_push(G, CODE(TLOP_COPY_NAME, n->global_str_idx));
       _bc_push(G, CODE(TLOP_CALL, rpn->toks[i].op_argc));
     }
+    else if (rpn->toks[i].type == TOK_INDEX)
+    {
+      TLName* n = tl_get_name(G->scope, "[]");
+      _bc_push(G, CODE(TLOP_COPY_NAME, n->global_str_idx));
+      _bc_push(G, CODE(TLOP_CALL, rpn->toks[i].op_argc));
+    }
+    else if (rpn->toks[i].type == TOK_BRACKET)
+    {
+      bra[bls++] = i;
+      _bc_push(G, CODE(TLOP_LB, 0));
+    }
+    else if (rpn->toks[i].type == TOK_COMMA && bls > 0)
+    {
+      _bc_push(G, CODE(TLOP_LC, 0));
+    }
     else if (rpn->toks[i].type == TOK_COMMA
           || rpn->toks[i].type == TOK_PARENTH)
       ;
@@ -679,6 +814,11 @@ void tl_rpn_to_bytecode(TLState* G, TokenizerOut* rpn, int start, int len)
     {
       _bc_push(G, CODE(TLOP_COPY_CONST, rpn->toks[i].arg));
     }
+  }
+  while (bls > 0)
+  {
+    bls--;
+    _bc_push(G, CODE(TLOP_LE, 0));
   }
 }
 
@@ -695,7 +835,7 @@ void tl_parse_to_bytecode(TLState* TL, char* code)
   {
     const int _prev_i = TS.i;
     TokenizerOut toks = tl_tokenize_string(TL, &TS, code);
-    puts("STOP");
+    // puts("STOP");
     if (toks.toksi == 0)
     {
       assert(TS.i != _prev_i);
@@ -729,7 +869,7 @@ void tl_parse_to_bytecode(TLState* TL, char* code)
         // 'fn' <prec> <func_name> '(' ...
         assert(toks.toks[2].type == TOK_NAME
             || toks.toks[2].type == TOK_OP);
-        prec = tl_to_int(TL->consts[toks.toks[1].arg]);
+        prec = tl_to_int_pro(TL->consts[toks.toks[1].arg]);
         offset = 1;
       }
       // else
@@ -744,7 +884,7 @@ void tl_parse_to_bytecode(TLState* TL, char* code)
           continue;
         assert(toks.toks[i].type == TOK_NAME);
         _bc_push(TL, CODE(TLOP_NEW_NAME, toks.toks[i].arg));
-        _bc_push(TL, CODE(TLOP_PARAM, i - 3 - offset));
+        _bc_push(TL, CODE(TLOP_PARAM, argc));
         argc++;
       }
 
@@ -753,7 +893,7 @@ void tl_parse_to_bytecode(TLState* TL, char* code)
         // operators can only have 1 or 2 arguments
 
       obj = TL->scope->names[toks.toks[1+offset].arg].data;
-      if (tl_type_of(obj) != TL_NIL)
+      if (tl_type_of_pro(obj) != TL_NIL)
       {
         int str_i = find_string_global(TL, "super");
         if (str_i == -1)

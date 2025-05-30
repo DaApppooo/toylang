@@ -41,21 +41,45 @@ bool _tl_str_eq(const char* s1, const char* s2)
   return *s1 == *s2;
 }
 
+void _tl_strn_from_int(char* buf, int64_t val, int n)
+{
+  assert(n > 1);
+  assert(val >= 0);
+  const int64_t init = val;
+  int len = 0;
+  while (val > 0)
+  { val /= 10; len++; }
+
+  if (len == 0)
+  {
+    buf[0] = '0';
+    buf[1] = 0;
+    return;
+  }
+  if (len >= n)
+    len = n-1;
+  val = init;
+  buf[len] = 0;
+  while (val > 0)
+  {
+    buf[--len] = val % 10;
+    val /= 10;
+  }
+}
+
 const char* tl_name_to_str(TLScope* S, int idx)
 {
   assert(S->names[idx].global_str_idx >= 0);
   assert(S->names[idx].global_str_idx < S->global->consts_len);
-  return tl_to_str(S->global->consts[S->names[idx].global_str_idx]);
+  return tl_to_str_pro(S->global->consts[S->names[idx].global_str_idx]);
 }
 
 // Call function on top of the stack
 // Returns the amount of returned values
 int tl_call(TLScope* S, int argc)
 {
-  printf("===========================\n");
-  tl_fdebug_scope(stdout, S);
   const int old_stack_top = S->stack_top;
-  const TLType func_type = tl_type_of(tl_top(S));
+  const TLType func_type = tl_type_of(S);
   const int prearg_stack_top = old_stack_top - argc - 1;
   int retc = 0;
   if (func_type == TL_NIL)
@@ -70,26 +94,21 @@ int tl_call(TLScope* S, int argc)
       S->global, S, S->stack_cap, S->max_name_count, f->bytecode_pt
     );
     retc = tl_run_bytecode_ex(
-      child, (void*)f, 1, argc
+      child, S->global->bc_len, 1, argc
     );
     const int offset = child->stack_top - retc;
     for (int i = 0; i < retc; i++)
     {
       S->stack[prearg_stack_top+i] = child->stack[i+offset];
       _tl_hold(S->global, S->stack[prearg_stack_top+i].object);
-      if (tl_is_valid_path(S->stack[prearg_stack_top+i].carrier))
+      if (S->stack[prearg_stack_top+i].ref)
       {
-        if (S->stack[prearg_stack_top+i].carrier.up == 0)
-          S->stack[prearg_stack_top+i].carrier = TL_INVALID_PATH;
-        else
-          S->stack[prearg_stack_top+i].carrier.up--;
+        if (
+           child->names <= S->stack[prearg_stack_top+i].ref
+        && child->names+child->name_count > S->stack[prearg_stack_top+i].ref
+        )
+          S->stack[prearg_stack_top+i].ref = NULL;
       }
-      // if (tl_is_valid_path(S->stack[prearg_stack_top+1].carrier))
-      // {
-      //   tl_object_t s =
-      //     S->global->consts[tl_name_walk_path(S, S->stack[prearg_stack_top+1].carrier)->global_str_idx];
-      //   printf("")
-      // }
     }
     S->stack_top = prearg_stack_top + retc;
     tl_destroy_scope(child);
@@ -107,10 +126,12 @@ int tl_call(TLScope* S, int argc)
   }
   else
   {
+    tl_push_type_name(S, func_type);
     fprintf(stderr,
       "ERROR: %s is not callable by default.",
-      tl_type_to_str(func_type)
+      tl_to_str(S)
     );
+    tl_pop(S);
     return 0;
   }
   if (S->stack_top < 0)
@@ -166,6 +187,16 @@ TLName* tl_get_name(TLScope *TL, const char* name)
   const int i = tl_set_name(org, name, NULL);
   return org->names + i;
 }
+TLName* tl_get_local(TLScope* S, const char* s)
+{
+  for (int i = 0; i < S->name_count; i++)
+  {
+    if (_tl_str_eq(tl_name_to_str(S, i), s))
+      return S->names + i;
+  }
+  const int i = tl_set_name(S, s, NULL);
+  return S->names + i;
+}
 
 TLName* tl_has_name_ex(TLScope *TL, int global_stack_str_index)
 {
@@ -213,9 +244,6 @@ TLScope* tl_new_scope_ex(
   }
   else
   {
-    // children need way less memory because they don't store constants nor
-    // the strings of names
-    mem_size /= 4;
     self->bc_pos = child_bcpos;
   }
   self->global = state;
@@ -231,6 +259,25 @@ TLScope* tl_new_scope_ex(
   return self;
 }
 
+void tl_destroy_custom(TLScope* S, tl_object_t custom)
+{
+  tl_push(S, custom);
+  tl_custom_info(S, TL_MSG_DESTROY);
+}
+
+void tl_destroy_object(TLScope* S, tl_object_t obj)
+{
+  if (tl_type_of_pro(obj) == TL_SCOPE)
+  {
+    tl_destroy_scope(((_TLScope*)obj)->scope);
+    TL_FREE(obj);
+  }
+  else if (tl_type_of_pro(obj) == TL_CUSTOM)
+    tl_destroy_custom(S, obj);
+  else
+    TL_FREE(obj);
+}
+
 void tl_destroy_scope(TLScope* S)
 {
   for (int i = 0; i < S->stack_top; i++)
@@ -244,13 +291,14 @@ void tl_destroy_scope(TLScope* S)
   }
   TL_FREE(S->names);
   S->stack_cap = S->stack_top = S->name_count = S->max_name_count = 0;
+  TL_FREE(S);
 }
+
 void tl_destroy(TLState* TL)
 {
   for (int i = 0; i < TL->gc_len; i++)
   {
-    if (TL->gc_data[i])
-    { TL_FREE(TL->gc_data[i]); }
+    tl_destroy_object(TL->scope, TL->gc_data[i]);
   }
   TL_FREE(TL->gc_ref_counts);
   TL_FREE(TL->gc_data);
@@ -261,7 +309,9 @@ void tl_destroy(TLState* TL)
   TL->bc_len = TL->bc_cap = 0;
   tl_destroy_scope(TL->scope);
   TL->scope = NULL;
+  TL_FREE(TL);
 }
+
 void tl_do_file(TLState* TL, FILE* f)
 {
   assert(f != NULL);
@@ -275,63 +325,6 @@ void tl_do_file(TLState* TL, FILE* f)
   TL_FREE(code);
 }
 
-bool tl_top_to_bool(TLScope* TL)
-{
-  const TLType cond_type = tl_type_of(tl_top(TL));
-  bool pass = true;
-  switch (cond_type)
-  {
-    case TL_NIL: pass = false; break;
-    case TL_BOOL: pass = tl_to_bool(tl_top(TL)); break;
-    case TL_INT: pass = tl_to_int(tl_top(TL)) != 0;
-      break;
-    case TL_FLOAT: pass = tl_to_float(tl_top(TL)) != 0.0; break;
-    case TL_FUNC:
-    case TL_CUSTOM:
-    case TL_CFUNC: pass = true; break;
-    case TL_STR:
-      pass = _tl_str_len(tl_to_str(tl_top(TL))) != 0;
-      break;
-    case TL_LIST:
-      pass = ((_TLList*)tl_top(TL))->len != 0;
-      break;
-  }
-  return pass;
-}
-
-TLPathInfo _tl_piname(TLScope *S, const char *name)
-{
-  TLPathInfo pi;
-  pi.up = 0;
-  do
-  {
-    for (int i = 0; i < S->name_count; i++)
-    {
-      if (_tl_str_eq(tl_name_to_str(S, i), name))
-      {
-        pi.index = i;
-        return pi;
-      }
-    }
-    if (S->parent == NULL)
-      break;
-    S = S->parent;
-    pi.up++;
-    assert(pi.up < UINT8_MAX);
-  } while (true);
-  return TL_INVALID_PATH;
-}
-
-TLName* tl_name_walk_path(TLScope* S, TLPathInfo path)
-{
-  for (; path.up > 0; path.up--)
-  {
-    S = S->parent;
-    assert(S != NULL);
-  }
-  return &(S->names[path.index]);
-}
-
 void tl_pop(TLScope* S)
 {
   if (S->stack_top == 0)
@@ -340,36 +333,77 @@ void tl_pop(TLScope* S)
   _tl_drop(S->global, S->stack[S->stack_top].object);
 }
 
-TLType tl_type_of(tl_object_t object)
+TLType tl_type_of_pro(tl_object_t obj)
 {
-  if (object == NULL)
+  if (obj == NULL)
     return TL_NIL;
-  return *(TLType*)(object);
+  return *(TLType*)obj;
 }
 
-uint64_t tl_size_of(tl_object_t object)
+void tl_push_type_name(TLScope* S, TLType type)
 {
-  const TLType type = tl_type_of(object);
+  const char* TABLE[TL_CUSTOM+1] = {
+    "nil", "int", "float", "bool", "str", "list", "function", "cfunction",
+    "custom"
+  };
+  if (type >= TL_CUSTOM)
+    tl_custom_info(S, TL_MSG_NAME);
+  else
+    tl_push_rstr(S, TABLE[type]);
+}
+
+uint64_t tl_size_of_pro(TLScope* S, tl_object_t obj)
+{
+  const TLType type = tl_type_of_pro(obj);
   switch (type)
   {
     case TL_NIL: return 0;
     case TL_INT: return sizeof(_TLInt);
-    case TL_FLOAT: return sizeof(_TLInt);
+    case TL_FLOAT: return sizeof(_TLFloat);
     case TL_STR: return sizeof(_TLStr);
     case TL_BOOL: return sizeof(_TLBool);
-    case TL_LIST:
-      return sizeof(_TLList)+((_TLList*)object)->len*sizeof(tl_object_t);
     case TL_CFUNC: return sizeof(_TLCFunc);
+    case TL_SCOPE: return sizeof(_TLScope);
     case TL_CUSTOM:
-      perror("TOYLANG: Custom objects not supported yet.");
+      perror("ERROR: Custom objects not supported yet.");
       abort();
       return 0;
     default:
-      fprintf(stderr, "TOYLANG: Unknown type with id: %i\n", (int)type);
+      fprintf(stderr, "ERROR: Unknown type with id: %i\n", (int)type);
       abort();
       return 0;
   }
 }
+
+bool tl_to_bool(TLScope* S)
+{
+  const int type = tl_type_of(S);
+  switch (type)
+  {
+    case TL_INT: return tl_to_int(S) != 0;
+    case TL_FLOAT: return tl_to_float(S) != 0;
+    case TL_CFUNC:
+    case TL_FUNC:
+    case TL_CUSTOM:
+      return true;
+    case TL_NIL:
+      return false;
+    case TL_BOOL:
+      return ((_TLBool*)tl_top(S))->value;
+    case TL_STR:
+      {
+      const char* s = tl_to_str(S);
+      return !(s == NULL || *s == 0);
+      }
+    case TL_SCOPE:
+      {
+      const TLScope* sc = tl_to_scope_pro(tl_top(S));
+      return sc->stack_top > 0 || sc->name_count > 0;
+      }
+  }
+  return false;
+}
+
 
 void _tl_hold(TLState* TL, tl_object_t obj)
 {
@@ -439,7 +473,7 @@ void _tl_drop(TLState* TL, tl_object_t obj)
       TL->gc_ref_counts[i]--;
       if (TL->gc_ref_counts[i] > 0)
         return;
-      TL_FREE(TL->gc_data[i]);
+      tl_destroy_object(TL->scope, TL->gc_data[i]);
       TL->gc_data[i] = NULL;
       count++;
       if (first_del == -1)
@@ -537,7 +571,7 @@ int tl_push_int_ex(TLScope* S, int64_t value)
   _tl_hold(S->global, i);
   i->type = TL_INT;
   i->value = value;
-  S->stack[S->stack_top].carrier = TL_INVALID_PATH;
+  S->stack[S->stack_top].ref = NULL;
   S->stack[S->stack_top++].object = i;
   return S->stack_top-1;
 }
@@ -550,10 +584,23 @@ int tl_push_str_ex(TLScope* TL, const char *value)
   _tl_hold(TL->global, i);
   i->type = TL_STR;
   i->owned = true;
-  memcpy((&(i->owned))+sizeof(i->owned), value, len+1);
-  TL->stack[TL->stack_top].carrier = TL_INVALID_PATH;
+  memcpy(i+1, value, len+1);
+  TL->stack[TL->stack_top].ref = NULL;
   TL->stack[TL->stack_top++].object = i;
   return TL->stack_top-1;
+}
+
+tl_object_t tl_push_rstr(TLScope* TL, const char *value)
+{
+  assert(TL->stack_top < TL->stack_cap);
+  _TLStr* i = TL_MALLOC(sizeof(_TLStr)+sizeof(char*));
+  _tl_hold(TL->global, i);
+  i->type = TL_STR;
+  i->owned = false;
+  memcpy(i+1, &value, sizeof(char*));
+  TL->stack[TL->stack_top].ref = NULL;
+  TL->stack[TL->stack_top++].object = i;
+  return i;
 }
 
 int tl_push_float_ex(TLScope* TL, double value)
@@ -563,7 +610,7 @@ int tl_push_float_ex(TLScope* TL, double value)
   _tl_hold(TL->global, i);
   i->type = TL_FLOAT;
   i->value = value;
-  TL->stack[TL->stack_top].carrier = TL_INVALID_PATH;
+  TL->stack[TL->stack_top].ref = NULL;
   TL->stack[TL->stack_top++].object = i;
   return TL->stack_top-1;
 }
@@ -575,53 +622,9 @@ int tl_push_bool_ex(TLScope*TL, bool value)
   _tl_hold(TL->global, i);
   i->type = TL_BOOL;
   i->value = value;
-  TL->stack[TL->stack_top].carrier = TL_INVALID_PATH;
+  TL->stack[TL->stack_top].ref = NULL;
   TL->stack[TL->stack_top++].object = i;
   return TL->stack_top-1;
-}
-
-tl_object_t tl_begin_list(TLScope* TL)
-{
-  assert(TL->stack_top < TL->stack_cap);
-  _TLList* i = TL_MALLOC(sizeof(_TLList));
-  _tl_hold(TL->global, i);
-  i->type = TL_LIST;
-  i->cap = 0;
-  i->len = 0;
-  TL->stack[TL->stack_top].carrier = TL_INVALID_PATH;
-  TL->stack[TL->stack_top++].object = i;
-  return i;
-}
-
-tl_object_t tl_end_list(TLScope* TL)
-{
-  // TODO
-  assert(false);
-  assert(TL->stack_top > 0);
-  int count = 0;
-  while (
-     TL->stack_top - count > 0
-  && (tl_type_of(TL->stack[TL->stack_top-count-1].object) != TL_LIST
-  || tl_size_of(TL->stack[TL->stack_top-count-1].object) > sizeof(_TLList))
-  ) {
-    count++;
-  }
-  if (TL->stack_top - count <= 0)
-  {
-    perror("tl_end_list called while no list began");
-    abort();
-  }
-  const int index = TL->stack_top-count-1;
-  _TLList* l = TL->stack[index].object;
-  // l->type = TL_LIST;
-  assert(l->type == TL_LIST);
-  l->len = count;
-  l->cap = count;
-  l = TL->stack[index].object
-    = realloc(l, sizeof(_TLList)+sizeof(tl_object_t)*count);
-  memcpy(l+1,TL->stack+index+1,sizeof(tl_object_t)*count);
-  TL->stack[index].carrier = TL_INVALID_PATH;
-  return l;
 }
 
 void tl_fdebug_scope(FILE* f, TLScope* S)
@@ -635,10 +638,10 @@ void tl_fdebug_scope(FILE* f, TLScope* S)
   {
     fprintf(f, " %p  %08i ", S->stack[i].object, i);
     tl_fdebug_obj(f, S->stack[i].object);
-    if (tl_is_valid_path(S->stack[i].carrier))
+    if (S->stack[i].ref)
     {
-      const TLName* name = tl_name_walk_path(S, S->stack[i].carrier);
-      fprintf(f, "  [%s]", tl_to_str(S->global->consts[name->global_str_idx]));
+      const TLName* name = S->stack[i].ref;
+      fprintf(f, "  [%s]", tl_to_str_pro(S->global->consts[name->global_str_idx]));
     }
     fprintf(f, "\n");
   }
@@ -650,7 +653,9 @@ void tl_fdebug_scope(FILE* f, TLScope* S)
   for (int i = 0; i < S->name_count; i++)
   {
     fprintf(f, "  %s = ", tl_name_to_str(S,i));
-    printf("(%p)[%s] ", S->names[i].data, tl_type_to_str(tl_type_of(S->names[i].data)));
+    tl_push_type_name(S, tl_type_of_pro(S->names[i].data));
+    printf("(%p)[%s] ", S->names[i].data, tl_to_str(S));
+    tl_pop(S);
     tl_fdebug_obj(f, S->names[i].data);
     fprintf(f, "\n");
   }
@@ -698,6 +703,14 @@ void tl_fdebug_state(FILE *f, TLState *TL)
   }
 }
 
+void tl_custom_info(TLScope* S, TLMSGType msg)
+{
+  _TLCustom* obj = tl_top(S);
+  tl_push_int(S, msg);
+  tl_push(S, S->global->consts[obj->info_func]);
+  tl_call(S, 2);
+}
+
 void tl_fdebug_instr(FILE* f, TLScope* TL, uint32_t code)
 {
   switch (tlbc_opcode(code))
@@ -715,7 +728,7 @@ void tl_fdebug_instr(FILE* f, TLScope* TL, uint32_t code)
       {
         fprintf(f, "an %i (%s)\n",
                 tlbc_arg(code),
-                tl_to_str(TL->global->consts[tlbc_arg(code)])
+                tl_to_str_pro(TL->global->consts[tlbc_arg(code)])
         );
         break;
       }
@@ -723,7 +736,7 @@ void tl_fdebug_instr(FILE* f, TLScope* TL, uint32_t code)
       {
         fprintf(f, "cn %i (%s)\n",
                 tlbc_arg(code),
-                tl_to_str(TL->global->consts[tlbc_arg(code)])
+                tl_to_str_pro(TL->global->consts[tlbc_arg(code)])
         );
         break;
       }
@@ -731,7 +744,7 @@ void tl_fdebug_instr(FILE* f, TLScope* TL, uint32_t code)
       fprintf(
         f, "nn %i (%s)\n",
         tlbc_arg(code),
-        tl_to_str(TL->global->consts[tlbc_arg(code)])
+        tl_to_str_pro(TL->global->consts[tlbc_arg(code)])
       );
       break;
     case TLOP_CONTINUE:
@@ -758,6 +771,15 @@ void tl_fdebug_instr(FILE* f, TLScope* TL, uint32_t code)
     case TLOP_EOS:
       fprintf(f, "eos\n");
       break;
+    case TLOP_LB:
+      fprintf(f, "lb %i\n", tlbc_arg(code));
+      break;
+    case TLOP_LC:
+      fprintf(f, "lc %i\n", tlbc_arg(code));
+      break;
+    case TLOP_LE:
+      fprintf(f, "le\n");
+      break;
     case TLOP_WHILE:
       fprintf(f, "while (depth=%i)\n", tlbc_arg(code));
       break;
@@ -771,7 +793,7 @@ void tl_fdebug_instr(FILE* f, TLScope* TL, uint32_t code)
       break;
     case TLOP_FN:
       fprintf(f, "fn %i [%s]\n", tlbc_arg(code),
-              tl_to_str(TL->global->consts[tlbc_arg(code)])
+              tl_to_str_pro(TL->global->consts[tlbc_arg(code)])
       );
       break;
     case TLOP_CALL:
@@ -785,7 +807,7 @@ void tl_fdebug_instr(FILE* f, TLScope* TL, uint32_t code)
 
 void tl_fdebug_obj(FILE* f, tl_object_t obj)
 {
-  switch (tl_type_of(obj))
+  switch (tl_type_of_pro(obj))
   {
     case TL_NIL:
       fprintf(f, "nil");
@@ -842,19 +864,15 @@ void tl_fdebug_obj(FILE* f, tl_object_t obj)
         ((_TLFunc*)obj)->argc, ((_TLFunc*)obj)->bytecode_pt
       );
       break;
-    case TL_LIST:
-      {
-        _TLList* l = obj;
-        fprintf(f, "[");
-        for (int i = 0; i < l->len; i++)
-        {
-          tl_fdebug_obj(f, *((tl_object_t*)(l+1) + i));
-          if (i < l->len-1)
-            fprintf(f, ", ");
-        }
-        fprintf(f, "]");
-        break;
-      }
+    case TL_SCOPE:
+      fprintf(
+        f, "<Scope stack(%i/%i), names(%i/%i)>",
+        tl_to_scope_pro(obj)->stack_top,
+        tl_to_scope_pro(obj)->stack_cap,
+        tl_to_scope_pro(obj)->name_count,
+        tl_to_scope_pro(obj)->max_name_count
+      );
+      break;
     case TL_CUSTOM:
       fprintf(f,"<custom>");
       break;

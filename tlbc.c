@@ -1,7 +1,7 @@
 #include "tl.h"
 #include <assert.h>
 
-int tl_run_bytecode_ex(TLScope *TL, tl_object_t scope, int depth,
+int tl_run_bytecode_ex(TLScope *TL, int len, int depth,
                        int param_count) {
   uint64_t conditional_block_info = 0;
   int fnh_register = -1;
@@ -10,8 +10,8 @@ int tl_run_bytecode_ex(TLScope *TL, tl_object_t scope, int depth,
 #define PUSH_LOOP() conditional_block_info = (conditional_block_info << 1) | 1
 #define PUSH_NOLOOP() conditional_block_info = (conditional_block_info << 1) | 0
 #define POP_CBI() conditional_block_info >>= 1
-  const int bc_len = TL->global->bc_len;
-  const uint32_t *bc = TL->global->bc;
+  const int bc_len = len;
+  uint32_t* const bc = TL->global->bc;
   for (uint32_t code = TL->bc_pos < bc_len ? bc[TL->bc_pos++] : TLOP_EXIT;
        tlbc_opcode(code) != TLOP_EXIT;
        code = TL->bc_pos < bc_len ? bc[TL->bc_pos++] : TLOP_EXIT) {
@@ -46,23 +46,10 @@ int tl_run_bytecode_ex(TLScope *TL, tl_object_t scope, int depth,
       {
       assert(tlbc_arg(code) >= 0);
       assert(tlbc_arg(code) < TL->global->consts_len);
-      TLPathInfo pi =
-          _tl_piname(TL, tl_to_str(TL->global->consts[tlbc_arg(code)]));
-      tl_object_t obj;
-      if (!tl_is_valid_path(pi))
-      {
-        const int index = tl_set_name_ex(TL, tlbc_arg(code), NULL);
-        obj = NULL;
-        pi.index = index;
-        pi.up = 0;
-      }
-      else
-      {
-        obj = tl_name_walk_path(TL, pi)->data;
-      }
-      _tl_hold(TL->global, obj);
-      tl_push(TL, obj);
-      tl_top_ex(TL)->carrier = pi;
+      TLName* name =
+          tl_get_name(TL, tl_to_str_pro(TL->global->consts[tlbc_arg(code)]));
+      tl_push(TL, name->data);
+      tl_top_ex(TL)->ref = name;
       break;
     }
     case TLOP_NEW_NAME:
@@ -87,7 +74,7 @@ int tl_run_bytecode_ex(TLScope *TL, tl_object_t scope, int depth,
             _tl_drop(TL->global, pt->names[i].data);
             pt->names[i].data = tl_top(TL);
             _tl_hold(TL->global, pt->names[i].data);
-            tl_top_ex(TL)->carrier = (TLPathInfo){.index = i, .up = up};
+            tl_top_ex(TL)->ref = pt->names + i;
             brk = true;
             break;
           }
@@ -100,7 +87,7 @@ int tl_run_bytecode_ex(TLScope *TL, tl_object_t scope, int depth,
       if (!brk)
       {
         const int i = tl_set_name_ex(TL, gsi, NULL);
-        tl_top_ex(TL)->carrier = (TLPathInfo){.index = i, .up = 0};
+        tl_top_ex(TL)->ref = TL->names + i;
       }
       break;
       }
@@ -115,9 +102,8 @@ int tl_run_bytecode_ex(TLScope *TL, tl_object_t scope, int depth,
       break;
     case TLOP_COPY_CONST:
       assert(TL->stack_top < TL->stack_cap);
-      _tl_hold(TL->global, TL->global->consts[tlbc_arg(code)]);
       tl_push(TL, TL->global->consts[tlbc_arg(code)]);
-      tl_top_ex(TL)->carrier = TL_INVALID_PATH;
+      tl_top_ex(TL)->ref = NULL;
       break;
     case TLOP_CALL:
       {
@@ -134,12 +120,10 @@ int tl_run_bytecode_ex(TLScope *TL, tl_object_t scope, int depth,
       {
         TL->names[tlbc_arg(code)].data =
             TL->parent->stack[TL->parent->stack_top - param_count - 1].object;
-        TL->parent->stack[TL->parent->stack_top - param_count - 1].carrier =
-            (TLPathInfo){.index = tlbc_arg(code), .up = 0};
+        TL->parent->stack[TL->parent->stack_top - param_count - 1].ref =
+            TL->names + tlbc_arg(code);
         param_count--;
       }
-      puts("=== POST ===");
-      tl_fdebug_scope(stdout, TL);
       break;
     case TLOP_COND: {
       if (tlbc_arg(code) == depth) {
@@ -163,7 +147,7 @@ int tl_run_bytecode_ex(TLScope *TL, tl_object_t scope, int depth,
     case TLOP_IF:
     {
       assert(tlbc_arg(code) == depth);
-      if (tl_top_to_bool(TL))
+      if (tl_to_bool(TL))
         PUSH_NOLOOP();
       else {
         do
@@ -195,7 +179,7 @@ int tl_run_bytecode_ex(TLScope *TL, tl_object_t scope, int depth,
       break;
     case TLOP_WHILE: {
       assert(tlbc_arg(code) == depth);
-      if (tl_top_to_bool(TL))
+      if (tl_to_bool(TL))
         PUSH_LOOP();
       else {
         do
@@ -233,6 +217,53 @@ int tl_run_bytecode_ex(TLScope *TL, tl_object_t scope, int depth,
       break;
     case TLOP_RET:
       return tlbc_arg(code);
+    case TLOP_LB:
+      {
+        int list_depth = 0;
+        int start = TL->bc_pos+1;
+        int i = TL->bc_pos+1;
+        TLScope* child = tl_new_scope_ex(
+          TL->global, TL, TL->stack_cap,
+          TL->max_name_count, i
+        );
+        if (tlbc_arg(bc[i]) != 0)
+          i += tlbc_arg(bc[i]);
+        while (tlbc_opcode(bc[i]) != TLOP_LE || list_depth > 0)
+        {
+          if (list_depth > 0)
+          {
+            if (tlbc_opcode(bc[i]) == TLOP_LE)
+              list_depth--;
+            else if (tlbc_opcode(bc[i]) == TLOP_LB)
+              list_depth++;
+            i++;
+          }
+          else
+          {
+            if (tlbc_opcode(bc[i]) == TLOP_LB)
+            {
+              list_depth++;
+              i += tlbc_arg(bc[i]);
+            }
+            else if (tlbc_opcode(bc[i]) == TLOP_LC)
+            {
+              bc[start] = CODE(tlbc_opcode(bc[start]), i - start);
+              child->bc_pos = start+1;
+              tl_run_bytecode_ex(child, i, depth, 0);
+              start = i;
+              if (tlbc_arg(bc[i]))
+                i += tlbc_arg(bc[i]) - 1;
+            }
+            i++;
+          }
+        }
+        _TLScope* virt = TL_MALLOC(sizeof(_TLScope));
+        virt->scope = child;
+        virt->type = TL_SCOPE;
+        TL->bc_pos = i+1;
+        tl_push(TL, virt);
+        break;
+      }
     case TLOP_END:
       assert(depth > 0);
       if (depth == scope_depth)
@@ -246,8 +277,11 @@ int tl_run_bytecode_ex(TLScope *TL, tl_object_t scope, int depth,
         depth--;
       POP_CBI();
       break;
+    case TLOP_LE:
+    case TLOP_LC:
+      assert(false);
     }
   }
   return 0;
 }
-void tl_run_bytecode(TLState *TL) { tl_run_bytecode_ex(TL->scope, NULL, 0, 0); }
+void tl_run_bytecode(TLState *TL) { tl_run_bytecode_ex(TL->scope, TL->bc_len, 0, 0); }
