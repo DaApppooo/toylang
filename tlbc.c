@@ -3,6 +3,7 @@
 
 int tl_run_bytecode_ex(TLScope *TL, int len, int depth,
                        int param_count) {
+  char _buf[16];
   uint64_t conditional_block_info = 0;
   int fnh_register = -1;
   const int scope_depth = depth;
@@ -31,10 +32,8 @@ int tl_run_bytecode_ex(TLScope *TL, int len, int depth,
       assert(tlbc_arg(code) < TL->global->consts_len);
       assert(fnh_register != -1);
       // const int pos = tl_push(TL, TL->global->consts[fnh_register]);
-      tl_set_name_ex(
-        TL, tlbc_arg(code),
-        TL->global->consts[fnh_register]
-      );
+      assert(tl_top_ex(TL)->ref);
+      tl_top_ex(TL)->ref->data = TL->global->consts[fnh_register];
       _tl_hold(TL->global, TL->global->consts[fnh_register]);
       fnh_register = -1;
       do
@@ -55,7 +54,7 @@ int tl_run_bytecode_ex(TLScope *TL, int len, int depth,
     case TLOP_NEW_NAME:
       assert(tlbc_arg(code) >= 0);
       assert(tlbc_arg(code) < TL->global->consts_len);
-      tl_set_name_ex(TL, tlbc_arg(code), NULL);
+      tl_set_local_ex(TL, tlbc_arg(code), NULL);
       break;
     case TLOP_ASSIGN_NAME:
       {
@@ -86,7 +85,7 @@ int tl_run_bytecode_ex(TLScope *TL, int len, int depth,
       } while (true);
       if (!brk)
       {
-        const int i = tl_set_name_ex(TL, gsi, NULL);
+        const int i = tl_set_local_ex(TL, gsi, NULL);
         tl_top_ex(TL)->ref = TL->names + i;
       }
       break;
@@ -103,11 +102,23 @@ int tl_run_bytecode_ex(TLScope *TL, int len, int depth,
     case TLOP_COPY_CONST:
       assert(TL->stack_top < TL->stack_cap);
       tl_push(TL, TL->global->consts[tlbc_arg(code)]);
-      tl_top_ex(TL)->ref = NULL;
+      break;
+    case TLOP_COPY_SMALL_INT:
+      assert(TL->stack_top < TL->stack_cap);
+      tl_push_int(TL, tlbc_arg(code));
+      break;
+    case TLOP_COPY_NIL:
+      assert(TL->stack_top < TL->stack_cap);
+      tl_push_nil(TL);
+      break;
+    case TLOP_COPY_BOOL:
+      assert(TL->stack_top < TL->stack_cap);
+      tl_push_bool(TL, tlbc_arg(code));
       break;
     case TLOP_CALL:
       {
         tl_call(TL, tlbc_arg(code));
+        if (tl_errored()) return 0;
         break;
       }
     case TLOP_PARAM:
@@ -118,12 +129,14 @@ int tl_run_bytecode_ex(TLScope *TL, int len, int depth,
         TL->names[tlbc_arg(code)].data = NULL;
       else
       {
-        TL->names[tlbc_arg(code)].data =
-            TL->parent->stack[TL->parent->stack_top - param_count - 1].object;
-        TL->parent->stack[TL->parent->stack_top - param_count - 1].ref =
-            TL->names + tlbc_arg(code);
+        const int idx = TL->parent->stack_top-param_count-1;
+        TL->names[tlbc_arg(code)].data = TL->parent->stack[idx].object;
         param_count--;
       }
+      break;
+    case TLOP_SELF:
+      assert(depth >= 1);
+      _tl_take_self(TL);
       break;
     case TLOP_COND: {
       if (tlbc_arg(code) == depth) {
@@ -220,14 +233,16 @@ int tl_run_bytecode_ex(TLScope *TL, int len, int depth,
     case TLOP_LB:
       {
         int list_depth = 0;
-        int start = TL->bc_pos+1;
-        int i = TL->bc_pos+1;
+        int start = TL->bc_pos;
+        int i = TL->bc_pos;
+        int prev_stack_pos = 0;
+        int elemc = 0;
         TLScope* child = tl_new_scope_ex(
           TL->global, TL, TL->stack_cap,
           TL->max_name_count, i
         );
-        if (tlbc_arg(bc[i]) != 0)
-          i += tlbc_arg(bc[i]);
+        if (tlbc_arg(bc[i-1]) != 0)
+          i += tlbc_arg(bc[i-1]);
         while (tlbc_opcode(bc[i]) != TLOP_LE || list_depth > 0)
         {
           if (list_depth > 0)
@@ -247,14 +262,57 @@ int tl_run_bytecode_ex(TLScope *TL, int len, int depth,
             }
             else if (tlbc_opcode(bc[i]) == TLOP_LC)
             {
-              bc[start] = CODE(tlbc_opcode(bc[start]), i - start);
-              child->bc_pos = start+1;
+              bc[start-1] = CODE(tlbc_opcode(bc[start-1]), i - start);
+              child->bc_pos = start;
               tl_run_bytecode_ex(child, i, depth, 0);
-              start = i;
+              int name_add = 0;
+              if (child->stack_top > prev_stack_pos)
+                name_add = child->stack_top - prev_stack_pos;
+              else
+              {
+                tl_push_nil(child);
+                name_add = 1;
+              }
+              for (int i = 0; i < name_add; i++)
+              {
+                _tl_idstr_from_int(_buf, elemc+i, sizeof(_buf));
+                TLName* const name = tl_get_local(child, _buf);
+                _tl_drop(TL->global, name->data);
+                name->data = child->stack[prev_stack_pos+i].object;
+                child->stack[prev_stack_pos+i].ref = name;
+                _tl_hold(TL->global, name->data);
+              }
+              elemc += name_add;
+              prev_stack_pos = child->stack_top;
+              start = i+1;
               if (tlbc_arg(bc[i]))
                 i += tlbc_arg(bc[i]) - 1;
             }
             i++;
+          }
+        }
+        if (i != start)
+        {
+          bc[start-1] = CODE(tlbc_opcode(bc[start-1]), i - start);
+          child->bc_pos = start;
+          tl_run_bytecode_ex(child, i, depth, 0);
+          start = i+1;
+          int name_add;
+          if (child->stack_top > prev_stack_pos)
+            name_add = child->stack_top - prev_stack_pos;
+          else
+          {
+            tl_push_nil(child);
+            name_add = 1;
+          }
+          for (int i = 0; i < name_add; i++)
+          {
+            _tl_idstr_from_int(_buf, elemc+i, sizeof(_buf));
+            TLName* const name = tl_get_local(child, _buf);
+            _tl_drop(TL->global, name->data);
+            name->data = child->stack[prev_stack_pos+i].object;
+            child->stack[prev_stack_pos+i].ref = name;
+            _tl_hold(TL->global, name->data);
           }
         }
         _TLScope* virt = TL_MALLOC(sizeof(_TLScope));

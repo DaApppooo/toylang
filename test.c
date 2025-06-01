@@ -32,10 +32,16 @@ int main(int argc, const char* argv[])
     fclose(f);
     
     TLState* TL = tl_new_state();
-    tl_load_openlib(TL);
+    tl_load_builtins(TL);
+    tl_load_openlib(TL->scope);
+    if (tl_errored())
+    { fprintf(stderr, "\e[0;31m%s\e[0m", tl_errored()); return 1; }
     tl_parse_to_bytecode(TL, buf);
-    tl_fdebug_state(stdout, TL);
+    if (tl_errored())
+    { fprintf(stderr, "\e[0;31m%s\e[0m", tl_errored()); return 1; }
     tl_run_bytecode(TL);
+    if (tl_errored())
+    { fprintf(stderr, "\e[0;31m%s\e[0m", tl_errored()); return 1; }
     tl_destroy(TL);
     free(buf);
   }

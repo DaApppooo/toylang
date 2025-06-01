@@ -32,7 +32,8 @@
 char* _tl_str_clone(const char* const s);
 int _tl_str_len(const char* const s);
 bool _tl_str_eq(const char* s1, const char* s2);
-void _tl_strn_from_int(char* buf, int64_t val, int n);
+void _tl_idstr_from_int(char* buf, int64_t val, int n);
+const char* _tl_fmt_name(const char* s);
 struct TLScope;
 typedef void* tl_object_t;
 typedef int(*tl_cfunc_ptr_t)(struct TLScope*, int argc);
@@ -198,15 +199,24 @@ TLScope* tl_new_scope_ex(
   TLScope* parent,
   int stack_cap,
   int max_name_count,
-  int child_bcpos
+  int bc_pos // bytecode position
 );
 TLState* tl_new_state();
-void tl_load_openlib(TLState* TL);
+void tl_load_builtins(TLState* TL);
+void tl_load_openlib(TLScope* TL);
 void tl_destroy(TLState* TL);
 void tl_destroy_scope(TLScope* TL);
 void tl_destroy_object(TLScope* S, tl_object_t obj);
 void tl_destroy_custom(TLScope* S, tl_object_t custom);
 TLScope* tl_scope_walk_path(TLScope* sc, int up);
+
+// === error management ===
+const char* tl_errored();
+void tl_throw(const char* error_format, ...);
+#define tl_expect_r(EXPECTATION, RETURN_VALUE, fmt) if (!(EXPECTATION)) \
+{ tl_throw("ERROR: " fmt "\n"); return RETURN_VALUE; }
+#define tl_expect_f(EXPECTATION, RETURN_VALUE, fmt, ...) if (!(EXPECTATION)) \
+{ tl_throw("ERROR: " fmt "\n", __VA_ARGS__); return RETURN_VALUE; }
 
 // === gc management ===
 void _tl_hold(TLState* TL, tl_object_t obj);
@@ -216,9 +226,10 @@ void _tl_drop(TLState* TL, tl_object_t obj);
 int _tl_consts_push(TLState* TL, tl_object_t obj);
 int _tl_consts_push_str(TLState* TL, const char* s);
 void tl_register_func(
-  TLState* TL, tl_cfunc_ptr_t f,
+  TLScope* TL, tl_cfunc_ptr_t f,
   const char* name, int max_arg, int prec
 );
+TLScope* tl_register_scope(TLScope* TL, const char* name);
 int _tl_op_call(TLScope* S, int argc);
 
 // === names ===
@@ -230,10 +241,12 @@ TLName* tl_get_local(TLScope* TL, const char* s);
 // Doesn't create the name. Returns NULL if the name doesn't exist.
 TLName* tl_has_name_ex(TLScope* TL, int global_stack_str_index);
 // Returns name index (used in bytecode)
-int tl_set_name_ex(TLScope* TL, int global_str_name, tl_object_t object);
-int tl_set_name(TLScope* TL, const char* name, tl_object_t object);
+int tl_set_local_ex(TLScope* TL, int global_str_name, tl_object_t object);
+int tl_set_local(TLScope* TL, const char* name, tl_object_t object);
 void tl_copy_name_ex(TLScope* TL, int global_str_name);
 void tl_copy_name(TLScope* TL, const char* name);
+void _tl_offer_self(tl_object_t obj);
+void _tl_take_self(TLScope* S);
 
 
 // === stack values ===
@@ -265,7 +278,7 @@ static inline uint64_t tl_size_of_ex(TLScope* S, int index)
 { return tl_size_of_pro(S, tl_get(S, index)); }
 static inline uint64_t tl_size_of(TLScope* S)
 { return tl_size_of_pro(S, tl_top(S)); }
-bool tl_to_bool(TLScope* S);
+bool tl_to_bool_pro(tl_object_t obj);
 static inline int64_t tl_to_int_pro(tl_object_t obj)
 { assert(tl_type_of_pro(obj) == TL_INT);
   return ((_TLInt*)obj)->value; }
@@ -313,6 +326,12 @@ TO_T_EZ(CT, T)
 TO_T(int64_t, int);
 TO_T(double, float);
 TO_T(char*, str);
+// TO_T(bool, bool); // 'bool' is a macro in C :(
+static inline bool tl_to_bool_ex(TLScope* S, int index)
+{ return tl_to_bool_pro(tl_get(S, index)); }
+static inline bool tl_to_bool(TLScope* S)
+{ return tl_to_bool_pro(tl_top(S)); }
+
 #undef TO_T_EX
 #undef TO_T_EZ
 #undef TO_T
@@ -324,7 +343,8 @@ void tl_custom_info(TLScope* S, TLMSGType msg);
 
 static inline int tl_push(TLScope* TL, tl_object_t obj)
 {
-  assert(TL->stack_top < TL->stack_cap);
+  if (!(TL->stack_top < TL->stack_cap))
+  { tl_throw("ERROR: Stack capacity exceeded.\n"); return 0; }
   _tl_hold(TL->global, obj);
   TL->stack[TL->stack_top].object = obj;
   TL->stack[TL->stack_top++].ref = NULL;
@@ -375,10 +395,14 @@ typedef enum : uint8_t
   // fnh <global_stack_function_index>
   TLOP_FNH, 
   TLOP_FN, // fn <global_stack_str_name_index> // nn + jump to end
+  TLOP_SELF, // calls _tl_take_self
   TLOP_NEW_NAME, // nn <global_stack_str_name_index>
   TLOP_ASSIGN_NAME, // an <global_stack_str_name_index>
   TLOP_COPY_NAME, // cg <global_stack_str_name_index>
   TLOP_COPY_CONST, // cc <stack_index>
+  TLOP_COPY_SMALL_INT, // csi <value>
+  TLOP_COPY_BOOL, // cbool <value>
+  TLOP_COPY_NIL, // cnil
   TLOP_POP, // pop <count>
   // Calls function at the top of the stack,
   // with parameters pushed in order.
@@ -444,10 +468,18 @@ static inline void tl_do_string(TLState* TL, char* ref_code)
 }
 void tl_do_file(TLState* TL, FILE* ref_f);
 void tl_do_path(TLState* TL, const char* ref_path);
+typedef struct TokenizerOut TokenizerOut;
+void tl_expr_to_rpn(
+  TLState* G,
+  TokenizerOut* toks,
+  int start, int len);
 
 #define TOKEN_STR_MAX MAX_NAME_LENGTH
 #define TOKEN_STACK_MAX 1024
 #define DEFAULT_BYTECODE_ALLOC 1024
+
+// These hashes are just the 8 bytes that make up the string
+// Will be improved in the future
 #define HASH_FN 0x666eUL
 #define HASH_IF 0x6966UL
 #define HASH_ELIF 0x656c6966UL
@@ -459,6 +491,9 @@ void tl_do_path(TLState* TL, const char* ref_path);
 #define HASH_CONTINUE 0x636f6e74696e7565UL
 #define HASH_RETURN 0x72657475726eUL
 #define HASH_END 0x656e64UL
+#define HASH_NIL 0x6e696cUL
+#define HASH_TRUE 0x74727565UL
+#define HASH_FALSE 0x66616c7365UL
 typedef enum TokenType : uint8_t
 {
   // TOK     , <arg>
@@ -466,6 +501,8 @@ typedef enum TokenType : uint8_t
   TOK_NAME, // <name_index>
   TOK_OP, // <name_index> 
   TOK_INT, // <stack_index>
+  TOK_SMALL_INT, // <value>
+  TOK_NIL, TOK_TRUE, TOK_FALSE,
   TOK_FLOAT, // <stack_index>
   TOK_STR, // <stack_index>
   TOK_COMMA,
@@ -506,10 +543,9 @@ typedef struct TokenizerOut
 {
   Token toks[TOKEN_STACK_MAX];
   int toksi;
-  int max_depth;
   int max_prec;
 } TokenizerOut;
-static const TokenizerOut TOKENIZER_EOF = (TokenizerOut){{}, -1, -1, -1};
+static const TokenizerOut TOKENIZER_EOF = (TokenizerOut){{}, -1, -1};
 TokenizerOut tl_tokenize_string(TLState *TL, TokenizerState* TS, char *code);
 void tl_parse_to_bytecode(TLState* TL, char* code);
 void tl_debug_token_array(TLState* TL, Token* a, int len, int current);
