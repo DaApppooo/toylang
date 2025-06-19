@@ -40,6 +40,30 @@ bool _tl_str_eq(const char* s1, const char* s2)
   return *s1 == *s2;
 }
 
+void _tl_dyn_push(void** data, size_t* size, size_t* cap, const void* item,
+                  int item_size)
+{
+  (*size) += item_size;
+  if (*size > *cap)
+  {
+    while (*cap < *size)
+      *cap += (*cap)/2 + (*cap < 2);
+    if (*data == NULL)
+      *data = malloc(*cap);
+    else
+      *data = realloc(*data, *cap);
+  }
+  memcpy(&((*data)[*size - 1]), item, item_size);
+}
+void _tl_dyn_prealloc_add(void** data, size_t* cap, int prealloc_bytes)
+{
+  *cap += prealloc_bytes;
+  if (*data == NULL)
+    *data = malloc(*cap);
+  else
+    *data = realloc(*data, *cap);
+}
+
 void _tl_idstr_from_int(char* buf, int64_t val, int n)
 {
   assert(n >= 8);
@@ -340,6 +364,141 @@ void tl_destroy(TLState* TL)
   tl_destroy_scope(TL->scope);
   TL->scope = NULL;
   TL_FREE(TL);
+}
+
+int _tl_find_in_gc(TLState* TL, tl_object_t obj)
+{
+  for (int i = 0; i < TL->gc_len; i++)
+  {
+    if (TL->gc_data[i] == obj)
+      return i;
+  }
+  return -1;
+}
+
+int _tl_find_virt_scope_in_gc(TLState* TL, TLScope* sc)
+{
+  if (sc->parent == NULL)
+    return -2;
+  else if (sc->parent == TL->scope)
+    return -1;
+  for (int i = 0; i < TL->gc_len; i++)
+  {
+    if (tl_type_of(TL->gc_data[i]) == TL_SCOPE)
+      if (tl_to_scope_pro(TL->gc_data[i]) == sc)
+        return i;
+  }
+  fprintf(
+    stderr,
+    "FATAL: Cannot serialize dangling scope %p (stored out of GC).",
+    sc
+  );
+  abort();
+  return 0;
+}
+
+int _tl_find_virt_scope_containing_name(TLState* TL, TLName* name)
+{
+#define IF_IN(SC) \
+  if (SC->names <= name && SC->names+SC->name_count < name)
+  IF_IN(TL->scope)
+    return -1;
+  for (int i = 0; i < TL->gc_len; i++)
+  {
+    if (tl_type_of_pro(TL->gc_data[i]) == TL_SCOPE)
+    {
+      IF_IN(tl_to_scope_pro(TL->gc_data[i]))
+        return i;
+    }
+  }
+  fprintf(stderr, "FATAL: Dangling name pointer %p not found in GC.", name);
+  abort();
+  return 0;
+}
+
+void tl_serialize_object(
+  TLState* TL,
+  char** data,
+  size_t* len,
+  size_t* cap,
+  tl_object_t obj
+) {
+#define PUSH(PTR, SIZE) \
+    _tl_dyn_push((void**)data, len, cap, (void*)PTR, SIZE)
+#define PUSHA(OBJ) \
+  PUSH(&(OBJ), sizeof(OBJ))
+  const TLType type = tl_type_of(obj);
+  if (type == TL_STR)
+  {
+    PUSHA(type);
+    PUSH(tl_to_str(obj), _tl_str_len(obj));
+  }
+  else if (type < TL_SCOPE)
+    PUSH(obj, tl_size_of_pro(TL->scope, obj));
+  else if (type == TL_SCOPE)
+  {
+    const TLScope* sc = tl_to_scope_pro(obj);
+    PUSHA(type);
+    // lengths section first
+    PUSHA(sc->bc_pos);
+    PUSHA(sc->stack_top);
+    PUSHA(sc->name_count);
+    // indicies
+    int idx;
+    // - parent
+    idx = _tl_find_virt_scope_in_gc(TL, sc->parent);
+    PUSHA(idx); // -2 means the scope doesn't have any parent (<=> NULL)
+                // -1 means the parent scope is the global scope
+                // other values are indexes in the GC
+    // - stack
+    for (int i = 0; i < sc->stack_top; i++)
+    {
+      idx = _tl_find_in_gc(TL, sc->stack[i].object);
+      PUSHA(idx);
+      if (sc->stack[i].ref)
+      {
+        idx = _tl_find_virt_scope_containing_name(TL, sc->stack[i].ref);
+        PUSHA(idx); // First is index of the scope in the GC
+                    // -1 here means it's the global scope
+        const TLScope* src = tl_to_scope_pro(TL->gc_data[idx]);
+        idx = sc->stack[i].ref - src->names;
+        PUSHA(idx); // Second is the index of the name in the list of names
+                      // in the previously indexed scope.
+      }
+      else
+      {
+        idx = -1;
+        PUSHA(idx); PUSHA(idx);
+      }
+    }
+    // - names
+    for (int i = 0; i < sc->name_count; i++)
+    {
+      idx = _tl_find_in_gc(TL, sc->names[i].data);
+      PUSHA(idx);
+      PUSHA(sc->names[i].global_str_idx);
+    }
+  }
+  else
+  {
+    tl_custom_info(TL->scope, TL_MSG_SERIALIZE);
+    if (tl_type_of(TL->scope) == TL_NIL)
+    {
+      
+    }
+  }
+  
+#undef PUSH
+}
+
+char* tl_serialize(TLState* TL, size_t* len)
+{
+  char* data = NULL;
+  size_t cap = 0;
+  *len = 0;
+  // GC is where everything is stored
+  // then it's just a matter of referencing gc with indexes
+  
 }
 
 void tl_do_file(TLState* TL, FILE* f)

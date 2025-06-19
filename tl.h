@@ -40,7 +40,7 @@ typedef int(*tl_cfunc_ptr_t)(struct TLScope*, int argc);
 
 /*
   WARNING: TL_CUSTOM objects must have their first bytes be:
-    TLType type = TL_CUSTOM;
+    TLType type = TL_CUSTOM (or higher);
     <! NO PADDING !>
     int registered_info_function;
     ... other bytes of the custom type ...
@@ -48,7 +48,7 @@ typedef int(*tl_cfunc_ptr_t)(struct TLScope*, int argc);
   The 'registered_info_function' is the index in the constants of the state of
   a function (or anything that's builtin callable) which takes two parameters:
     1. The object from which ToyLang wishes to recover information from.
-    2. The info asked by ToyLand. Can be only one at a time, and only one of:
+    2. The info asked by ToyLang. Can be only one at a time, and only one of:
       - TL_MSG_NAME
         Must return a TL_STR which contains the name of the custom type.
         This is used by the "is" operator and tl_type_to_str().
@@ -65,12 +65,24 @@ typedef int(*tl_cfunc_ptr_t)(struct TLScope*, int argc);
       - TL_MSG_DESTROY
         The function must handle all destroying of the type. Including freeing
         the tl_objec_t pointer.
+      - TL_SERIALIZE
+        The returned object is a "serialized version" of the given object. That
+        is, a contiguous block of memory, following the standard for custom
+        types, which size is given by a call to the registered_info_function
+        with the flag TL_MSG_SIZEOF.
+      - TL_DESERIALIZE
+        The given object is the "serialized version" as output by a
+        TL_SERIALIZE call. The output object is the initial version before the
+        TL_SERIALIZE call.
   All five must be declared. In case you don't want to bother writing all of
   them or if any doesn't make sense in your context, you can just return nil,
   in which case a default value will be returned. Note that this can become an
   issue with 'TL_MSG_SIZEOF' if any other custom type depends on the size of
-  your object (the default value being 0). The minimum required is
-  TL_MSG_DESTROY, or else memory leaks can occur.
+  your object or if your type has to be serialized (the default value being 0).
+  The minimum required is TL_MSG_DESTROY, or else memory leaks can occur.
+  TL_SERIALIZE and TL_DESERIALIZE will use the object passed as a parameter if
+  nil is returned.
+
 */
 typedef enum TLType : uint8_t
 {
@@ -79,11 +91,13 @@ typedef enum TLType : uint8_t
 } TLType;
 typedef enum TLMSGType : int64_t
 {
-  TL_MSG_NAME = 0,
-  TL_MSG_SIZEOF = 1,
-  TL_MSG_COPY = 2,
-  TL_MSG_REPR = 3,
-  TL_MSG_DESTROY = 4
+  TL_MSG_NAME,
+  TL_MSG_SIZEOF,
+  TL_MSG_COPY,
+  TL_MSG_REPR,
+  TL_MSG_DESTROY,
+  TL_MSG_SERIALIZE,
+  TL_MSG_DESERIALIZE
 } TLMSGType;
 typedef struct TLName
 {
@@ -209,6 +223,8 @@ void tl_destroy_scope(TLScope* TL);
 void tl_destroy_object(TLScope* S, tl_object_t obj);
 void tl_destroy_custom(TLScope* S, tl_object_t custom);
 TLScope* tl_scope_walk_path(TLScope* sc, int up);
+char* tl_serialize(TLState* in_TL, size_t* out_size);
+void tl_deserialize(TLState* out_TL, char* in_data, size_t size);
 
 // === error management ===
 const char* tl_errored();
